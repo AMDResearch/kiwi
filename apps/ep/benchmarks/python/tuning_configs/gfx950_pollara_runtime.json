@@ -1,0 +1,31 @@
+{
+  "version": "1.0",
+  "gpu_arch": "gfx950",
+  "gpu_model": "mi355x",
+  "nic_family": "pollara",
+  "rules": [
+    {"world_size": 8, "num_tokens": 1, "num_blocks": 12, "rcomp_backend": "hybrid"},
+    {"world_size": 8, "num_tokens": 2, "num_blocks": 12, "rcomp_backend": "hybrid"},
+    {"world_size": 8, "num_tokens": 4, "num_blocks": 16, "rcomp_backend": "hybrid"},
+    {"world_size": 8, "num_tokens": 8, "num_blocks": 32, "rcomp_backend": "hybrid"},
+    {"world_size": 8, "num_tokens": 16, "num_blocks": 48, "rcomp_backend": "hybrid"},
+    {"world_size": 8, "num_tokens": 32, "num_blocks": 48, "rcomp_backend": "hybrid"},
+    {"world_size": 8, "num_tokens": 64, "num_blocks": 64, "rcomp_backend": "hybrid"},
+
+    {"world_size": 16, "num_tokens": 1, "num_blocks": 16, "rcomp_backend": "hybrid"},
+    {"world_size": 16, "num_tokens": 2, "num_blocks": 24, "rcomp_backend": "hybrid"},
+    {"world_size": 16, "num_tokens": 4, "num_blocks": 24, "rcomp_backend": "hybrid"},
+    {"world_size": 16, "num_tokens": 8, "num_blocks": 48, "rcomp_backend": "hybrid"},
+    {"world_size": 16, "num_tokens": 16, "num_blocks": 64, "rcomp_backend": "hybrid"},
+    {"world_size": 16, "num_tokens": 32, "num_blocks": 64, "rcomp_backend": "hybrid"},
+    {"world_size": 16, "num_tokens": 64, "num_blocks": 64, "rcomp_backend": "hybrid"},
+
+    {"world_size": 32, "num_tokens": 1, "num_blocks": 12, "rcomp_backend": "hybrid"},
+    {"world_size": 32, "num_tokens": 2, "num_blocks": 20, "rcomp_backend": "hybrid"},
+    {"world_size": 32, "num_tokens": 4, "num_blocks": 24, "rcomp_backend": "hybrid"},
+    {"world_size": 32, "num_tokens": 8, "num_blocks": 24, "rcomp_backend": "hybrid"},
+    {"world_size": 32, "num_tokens": 16, "num_blocks": 24, "rcomp_backend": "hybrid"},
+    {"world_size": 32, "num_tokens": 32, "num_blocks": 32, "rcomp_backend": "hybrid"},
+    {"world_size": 32, "num_tokens": 64, "num_blocks": 64, "rcomp_backend": "hybrid"}
+  ]
+}
