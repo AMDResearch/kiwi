@@ -219,22 +219,15 @@ void context_t::spawn_proxy_threads(int num_threads, int first_core) {
     // Resolve the current HIP device's nearby CPUs in the spawning thread so
     // callers that selected a device with hipSetDevice() get the expected GPU
     // locality even if newly-created host threads would otherwise default to
-    // HIP device 0. The proxy thread still pins itself. If the caller supplies
-    // first_core, use that explicit contiguous CPU assignment instead.
-    std::vector<int> proxy_cpu_assignments;
-    if (first_core >= 0) {
-        proxy_cpu_assignments.reserve(static_cast<size_t>(num_threads));
-        for (int i = 0; i < num_threads; ++i) {
-            proxy_cpu_assignments.push_back(first_core + i);
-        }
-    } else {
-        proxy_cpu_assignments = topology::choose_proxy_thread_cpus(num_threads);
-    }
+    // HIP device 0. If the caller supplies first_core, proxy thread i is bound
+    // to CPU first_core + i instead.
+    const std::vector<int> proxy_cpus =
+        first_core >= 0 ? std::vector<int>{} : topology::proxy_thread_cpu_set();
 
     for (int i = 0; i < num_threads; i++) {
-        const int selected_cpu = proxy_cpu_assignments[static_cast<size_t>(i)];
-        proxy_threads.emplace_back(&context_t::proxy_thread_func, this, i, num_threads,
-                                   selected_cpu);
+        proxy_threads.emplace_back(
+            &context_t::proxy_thread_func, this, i, num_threads,
+            first_core >= 0 ? std::vector<int>{first_core + i} : proxy_cpus);
     }
 }
 
@@ -247,9 +240,9 @@ void context_t::join_proxy_threads() {
 }
 
 void context_t::proxy_thread_func(int thread_id, int num_proxy_threads,
-                                  int selected_cpu) {
+                                  std::vector<int> cpus) {
     int device_idx = thread_id % num_devices;
-    topology::pin_proxy_thread_to_cpu(thread_id, num_proxy_threads, selected_cpu);
+    topology::bind_current_thread_to_cpus(cpus);
     internal::tl_device_idx = device_idx;
     internal::tl_device = devices[device_idx];
     auto* noop = new internal::comp_noop_t();

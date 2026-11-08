@@ -304,13 +304,14 @@ void ep_comm_context_t::spawn_proxy_threads(int num_threads) {
     assert(proxy_threads_.empty());
     stop_proxy_threads_.store(false, std::memory_order_relaxed);
 
-    const std::vector<int> proxy_cpu_assignments =
-        kiwi::p2p::topology::choose_proxy_thread_cpus(num_threads);
+    // Resolve the CPU set on the spawning thread, which has the context's
+    // HIP device selected.
+    const std::vector<int> proxy_cpus =
+        kiwi::p2p::topology::proxy_thread_cpu_set();
 
     for (int i = 0; i < num_threads; i++) {
-        const int selected_cpu = proxy_cpu_assignments[static_cast<size_t>(i)];
         proxy_threads_.emplace_back(&ep_comm_context_t::proxy_thread_func,
-                                    this, i, num_threads, selected_cpu);
+                                    this, i, num_threads, proxy_cpus);
     }
 }
 
@@ -331,10 +332,9 @@ void ep_comm_context_t::publish_active_queue_count(int active_count) {
 
 void ep_comm_context_t::proxy_thread_func(int thread_id,
                                                int num_proxy_threads,
-                                               int selected_cpu) {
+                                               std::vector<int> cpus) {
     int device_idx = thread_id % num_devices_;
-    kiwi::p2p::topology::pin_proxy_thread_to_cpu(thread_id, num_proxy_threads,
-                                            selected_cpu);
+    kiwi::p2p::topology::bind_current_thread_to_cpus(cpus);
 
     internal::tl_device_idx = device_idx;
     internal::tl_device = devices_[device_idx];

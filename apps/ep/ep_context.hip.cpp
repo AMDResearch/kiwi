@@ -5,7 +5,9 @@
 #include "all2all.hip.hpp"
 #include "assert.hpp"
 #include "hip_check.hpp"
+#include "topology.hpp"
 #include <hip/hip_runtime.h>
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -113,6 +115,18 @@ ep_context_t::ep_context_t(const config_t& cfg)
             std::to_string(cfg_.max_num_inp_token_per_rank) +
             " must be positive");
     }
+    // Resolve the tuning-table key before anything is sized from the
+    // automatic launch policy.
+    if (cfg_.gpu_arch.empty()) {
+        cfg_.gpu_arch = current_gpu_arch();
+    }
+    if (cfg_.nic_family.empty()) {
+        cfg_.nic_family = nic_family_for_hca(
+            cfg_.device_name.empty()
+                ? kiwi::p2p::topology::
+                      get_requested_or_auto_hca_name_for_current_gpu()
+                : cfg_.device_name);
+    }
     const int provisioned_num_blocks = cfg_.provisioned_num_blocks();
     if (provisioned_num_blocks <= 0) {
         throw std::invalid_argument(
@@ -133,6 +147,19 @@ ep_context_t::ep_context_t(const config_t& cfg)
     comm_ctx_ = std::make_unique<ep_comm_context_t>(
         cfg_.num_queues(), cfg_.num_devices, cfg_.device_name,
         static_cast<size_t>(cfg_.queue_capacity));
+
+    // The automatic policy depends on each rank's detected hardware, so agree
+    // on whether to provision: every rank must join the setup collectives.
+    {
+        std::vector<char> all_required(
+            static_cast<size_t>(lci::get_rank_n()), 0);
+        const char local_required = rcomp_ipc_resources_provisioned_ ? 1 : 0;
+        lci::allgather_x(&local_required, all_required.data(), 1)
+            .device(comm_ctx_->get_setup_device())();
+        rcomp_ipc_resources_provisioned_ =
+            std::find(all_required.begin(), all_required.end(), 1)
+            != all_required.end();
+    }
 
     if (rcomp_ipc_resources_provisioned_) {
         const int rank_n = lci::get_rank_n();

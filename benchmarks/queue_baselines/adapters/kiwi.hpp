@@ -77,7 +77,7 @@ struct KiwiSpscAdapter : detail::KiwiAdapter<kiwi::queue::SPSCD2HQueue, false> {
     static std::string notes() {
         return "16B message in one 64B line of 16B chunks (8B payload + 8B epoch "
                "signal each), one 16B store per lane; producer/cached-consumer "
-               "index in registers; batched consumer index; no atomics";
+               "index in registers; consumer index published per pop; no atomics";
     }
 };
 
@@ -90,7 +90,7 @@ struct KiwiMpscAdapter : detail::KiwiAdapter<kiwi::queue::MPSCD2HQueue, true> {
     static std::string notes() {
         return "16B message in one 64B line of 16B chunks, one 16B store per lane; "
                "lane-0 agent-scope fetch-add line claim on a VRAM index; cached "
-               "credit; single host consumer, batched consumer index";
+               "credit; single host consumer, consumer index published per pop";
     }
 };
 

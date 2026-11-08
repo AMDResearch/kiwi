@@ -9,7 +9,10 @@
  * Reports percentile statistics for latency distribution.
  *
  * Uses the SPSC (default) or MPSC (--mpsc) device-to-host queue with one
- * producer wavefront and messages of 8 to 512 bytes (--bytes).
+ * producer wavefront and messages of 8 to 512 bytes (--bytes). --push and
+ * --lanes select how the wave pushes (collective or lane-masked; see
+ * queue_bench.hip.hpp): each iteration is one step, and the host acks once it
+ * has popped all of the step's messages.
  */
 
 #include <kiwi/queue/queue.hpp>
@@ -34,29 +37,58 @@ struct ExperimentParams {
     int num_iterations = 1000000;
     bool mpsc = false;
     int message_bytes = 56;
+    queue_bench::Push push = queue_bench::Push::Collective;
+    int lanes = 64;
     bool latency_stats = false;
     bool verbose = false;
 };
 
-// Templated ping-pong kernel — works with any DeviceHandle type
-template<typename DeviceHandle, size_t Bytes>
+// Ping-pong kernel: one step of pattern P per iteration, then wait for the
+// host's ack.
+template<typename DeviceHandle, queue_bench::Push P, size_t Bytes>
 __global__ void ping_pong_latency_kernel(
     DeviceHandle queue,
+    int lanes,
     volatile uint64_t* ack_flag,
     int num_iterations,
     uint64_t* latencies,
     int warmup_iterations,
     bool latency_stats
 ) {
-    queue_bench::Message<Bytes> msg{};
+    using queue_bench::Push;
+    if constexpr (P == Push::Collective) {
+        // The collective loop as before lane-masked pushes, so its code (and
+        // results) stay comparable.
+        queue_bench::Message<Bytes> msg{};
 
+        uint64_t t_prev;
+        if (latency_stats)
+            t_prev = wall_clock64();
+
+        for (int i = 0; i < num_iterations; ++i) {
+            msg.value = static_cast<uint32_t>(i);
+            while (!queue.push_reg(msg)) {}
+            asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
+
+            uint64_t expected_ack = i + 1;
+            while (*ack_flag < expected_ack) {}
+
+            if (latency_stats) {
+                uint64_t t_now = wall_clock64();
+                if (__lane_id() == 0 && i >= warmup_iterations)
+                    latencies[i - warmup_iterations] = t_now - t_prev;
+                t_prev = t_now;
+            }
+        }
+        return;
+    }
+    const int msgs = queue_bench::step_messages(P, lanes);
     uint64_t t_prev;
     if (latency_stats)
         t_prev = wall_clock64();
 
     for (int i = 0; i < num_iterations; ++i) {
-        msg.value = static_cast<uint32_t>(i);
-        while (!queue.push_reg(msg)) {}
+        queue_bench::push_step<P, Bytes>(queue, static_cast<uint32_t>(i * msgs), lanes);
         asm volatile("s_waitcnt vmcnt(0)" ::: "memory");
 
         uint64_t expected_ack = i + 1;
@@ -101,10 +133,10 @@ void print_stats(const std::vector<uint64_t>& latencies, const char* title) {
     std::cout << "  Avg:    " << std::setw(8) << avg / 1000.0 << " us\n";
 }
 
-// Templated benchmark — works with any queue type
-template<typename QueueType, size_t Bytes>
+// Templated benchmark — works with any queue type and push pattern
+template<typename QueueType, queue_bench::Push P, size_t Bytes>
 void benchmark_ping_pong_latency(const ExperimentParams& params) {
-    const auto kernel = ping_pong_latency_kernel<typename QueueType::DeviceHandle, Bytes>;
+    const auto kernel = ping_pong_latency_kernel<typename QueueType::DeviceHandle, P, Bytes>;
     require_no_scratch(kernel, "ping_pong_latency_kernel");
 
     int wallClkRate;
@@ -113,6 +145,7 @@ void benchmark_ping_pong_latency(const ExperimentParams& params) {
 
     auto queue = std::make_unique<QueueType>(params.queue_capacity);
     int measured = params.num_iterations;
+    const int msgs = queue_bench::step_messages(P, params.lanes);
 
     volatile uint64_t* ack_flag;
     KIWI_HIP_CHECK(hipHostMalloc((void**)&ack_flag, sizeof(uint64_t), hipHostMallocCoherent));
@@ -127,23 +160,32 @@ void benchmark_ping_pong_latency(const ExperimentParams& params) {
 
     auto start = std::chrono::high_resolution_clock::now();
     kernel<<<1, 64, 0, stream>>>(
-        queue->device_handle(), ack_flag, measured, d_latencies, 0, params.latency_stats
+        queue->device_handle(), params.lanes, ack_flag, measured, d_latencies, 0,
+        params.latency_stats
     );
 
-    for (int i = 0; i < measured; ++i) {
-        alignas(8) uint8_t buf[kMaxMessageBytes];
-        while (!queue->pop(buf)) {}
+    bool ok = true;
+    for (int i = 0; i < measured && ok; ++i) {
+        // A step's messages arrive in order: seq, seq + 1, ...
+        const uint32_t seq = static_cast<uint32_t>(i) * msgs;
+        for (int j = 0; j < msgs; ++j) {
+            alignas(8) uint8_t buf[kMaxMessageBytes];
+            while (!queue->pop(buf)) {}
 
-        uint32_t value = 0;
-        std::memcpy(&value, buf, sizeof(value));
-        if (value != static_cast<uint32_t>(i)) {
-            std::cerr << "ERROR: Expected " << i << ", got " << value << "\n";
-            break;
+            uint32_t value = 0;
+            std::memcpy(&value, buf, sizeof(value));
+            if (value != seq + j) {
+                std::cerr << "ERROR: step " << i << ": expected " << seq + j << ", got " << value
+                          << "\n";
+                ok = false;
+                break;
+            }
         }
 
         std::atomic_thread_fence(std::memory_order_release);
         *ack_flag = i + 1;
     }
+    if (!ok) exit(1);
 
     KIWI_HIP_CHECK(hipStreamSynchronize(stream));
 
@@ -186,10 +228,18 @@ int main(int argc, char** argv) {
     app.add_flag("--mpsc", params.mpsc, "Use the MPSC queue");
     app.add_option("--bytes", params.message_bytes, "Message bytes")
         ->default_val(56)->check(CLI::IsMember(queue_bench::sizes()));
+    app.add_option("--push", params.push, "collective, lane-masked or mixed")
+        ->transform(CLI::CheckedTransformer(queue_bench::push_names()));
+    app.add_option("--lanes", params.lanes, "Active lanes per lane-masked push call")
+        ->default_val(64)->check(CLI::Range(1, 64));
     app.add_flag("-s,--stats", params.latency_stats, "Detailed latency percentiles");
     app.add_flag("-v,--verbose", params.verbose, "Verbose output");
 
     CLI11_PARSE(app, argc, argv);
+    if (!queue_bench::lane_masked_call_fits(params.push, params.lanes, params.message_bytes,
+                                            params.queue_capacity)) {
+        return 1;
+    }
 
     check_numa_affinity();
     gpu_clock_warmup();
@@ -198,16 +248,22 @@ int main(int argc, char** argv) {
     std::cout << "====================================\n";
     std::cout << "Queue capacity: " << params.queue_capacity << " lines\n";
     std::cout << "Message bytes: " << params.message_bytes << "\n";
+    std::cout << "Push: " << queue_bench::push_name(params.push);
+    if (params.push != queue_bench::Push::Collective) std::cout << ", " << params.lanes << " lanes";
+    std::cout << "\n";
     std::cout << "Iterations: " << params.num_iterations << "\n";
     std::cout << "Latency stats: " << (params.latency_stats ? "enabled" : "disabled") << "\n";
     std::cout << "Target: < 2 us average latency\n\n";
 
     queue_bench::dispatch(params.message_bytes, [&](auto bytes) {
-        constexpr size_t B = decltype(bytes)::value;
-        if (params.mpsc)
-            benchmark_ping_pong_latency<MPSCD2HQueue, B>(params);
-        else
-            benchmark_ping_pong_latency<SPSCD2HQueue, B>(params);
+        queue_bench::dispatch_push(params.push, [&](auto push) {
+            constexpr size_t B = decltype(bytes)::value;
+            constexpr queue_bench::Push P = decltype(push)::value;
+            if (params.mpsc)
+                benchmark_ping_pong_latency<MPSCD2HQueue, P, B>(params);
+            else
+                benchmark_ping_pong_latency<SPSCD2HQueue, P, B>(params);
+        });
     });
 
     return 0;

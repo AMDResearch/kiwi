@@ -6,7 +6,9 @@
  * @brief Measure GPU invoke operation overhead with invoke
  *
  * Measures the overhead of callback invocations using GPU realtime clock.
- * Reports per-operation timing with percentile statistics.
+ * Reports per-operation timing with percentile statistics. With --lanes K,
+ * each timed call is one invoke_lane_masked() with lanes [0, K) active (K
+ * callbacks per call) instead of one invoke().
  */
 
 #include <kiwi/invoke/invoke.hpp>
@@ -28,6 +30,7 @@ struct ExperimentParams {
     int queue_capacity = 1024;
     int num_messages = 100000;
     int warmup_iterations = -1;  // -1 means auto-calculate
+    int lanes = 0;               // > 0: invoke_lane_masked() with this many active lanes
     bool verbose = false;
 
     int get_warmup() const {
@@ -36,6 +39,8 @@ struct ExperimentParams {
         }
         return std::min(1000, num_messages / 10);
     }
+    // Callbacks per timed call.
+    int per_call() const { return lanes > 0 ? lanes : 1; }
 };
 
 // GPU wall clock - returns raw ticks (converted to nanoseconds on host side)
@@ -67,6 +72,45 @@ __global__ void timed_invoke_kernel(DeviceContext<>* ctx,
         if (__lane_id() == 0 && i >= warmup_msgs) {
             invoke_times[i - warmup_msgs] = t1 - t0;
         }
+    }
+}
+
+// Like timed_invoke_kernel, but each call is one invoke_lane_masked() in
+// which lanes [0, lanes) invoke the callback with their own sequence number.
+__global__ void timed_invoke_lane_masked_kernel(DeviceContext<>* ctx,
+                                                uint8_t callback_id,
+                                                int num_calls,
+                                                int lanes,
+                                                uint64_t* invoke_times,
+                                                int warmup_calls) {
+    auto handle = ctx->get_device_handle(0);
+    const uint32_t lane = __lane_id();
+
+    for (int i = 0; i < num_calls; ++i) {
+        uint64_t t0 = gpu_clock_ticks();
+
+        while (!handle.invoke_lane_masked(callback_id, lane < static_cast<uint32_t>(lanes),
+                                          static_cast<uint32_t>(i * lanes + lane))) {}
+
+        uint64_t t1 = gpu_clock_ticks();
+
+        if (lane == 0 && i >= warmup_calls) {
+            invoke_times[i - warmup_calls] = t1 - t0;
+        }
+    }
+}
+
+// Launches the timed kernel of params.lanes: `calls` calls of
+// params.per_call() callbacks each.
+void launch_timed(const ExperimentParams& params, DeviceContext<>* ctx, uint8_t callback_id,
+                  int calls, uint64_t* times, int warmup_calls, hipStream_t stream) {
+    if (params.lanes > 0) {
+        require_no_scratch(timed_invoke_lane_masked_kernel, "timed_invoke_lane_masked_kernel");
+        timed_invoke_lane_masked_kernel<<<1, 64, 0, stream>>>(ctx, callback_id, calls,
+                                                              params.lanes, times, warmup_calls);
+    } else {
+        require_no_scratch(timed_invoke_kernel, "timed_invoke_kernel");
+        timed_invoke_kernel<<<1, 64, 0, stream>>>(ctx, callback_id, calls, times, warmup_calls);
     }
 }
 
@@ -131,8 +175,12 @@ void benchmark_invoke_overhead(const ExperimentParams& params) {
 
     Context ctx(1, params.queue_capacity);
 
-    int warmup_msgs = params.get_warmup();
-    int measured_msgs = params.num_messages - warmup_msgs;
+    // Calls of params.per_call() callbacks each.
+    const int calls = params.num_messages / params.per_call();
+    const uint32_t total = static_cast<uint32_t>(calls * params.per_call());
+    int warmup_msgs = std::min(1000, calls / 10);
+    if (params.warmup_iterations >= 0) warmup_msgs = params.warmup_iterations;
+    int measured_msgs = calls - warmup_msgs;
 
     // Register callback
     std::atomic<uint32_t> expected{0};
@@ -152,14 +200,13 @@ void benchmark_invoke_overhead(const ExperimentParams& params) {
     // Start GPU kernel
     hipStream_t stream;
     KIWI_HIP_CHECK(hipStreamCreate(&stream));
-    require_no_scratch(timed_invoke_kernel, "timed_invoke_kernel");
-    timed_invoke_kernel<<<1, 64, 0, stream>>>(ctx.device_context(), callback_id, params.num_messages,
-                                               d_invoke_times, warmup_msgs);
+    launch_timed(params, ctx.device_context(), callback_id, calls, d_invoke_times, warmup_msgs,
+                 stream);
 
     // CPU consumer - process all callbacks to prevent queue from filling
     auto start = std::chrono::high_resolution_clock::now();
 
-    while (expected.load() < static_cast<uint32_t>(params.num_messages)) {
+    while (expected.load() < total) {
         ctx.progress(0);
     }
 
@@ -180,7 +227,7 @@ void benchmark_invoke_overhead(const ExperimentParams& params) {
 
     // Calculate throughput
     auto total_time_us = std::chrono::duration_cast<std::chrono::microseconds>(end - start).count();
-    double throughput = (double)params.num_messages / total_time_us * 1e6;
+    double throughput = (double)total / total_time_us * 1e6;
 
     std::cout << "Throughput: " << std::fixed << std::setprecision(2)
               << throughput / 1e6 << " M msgs/sec\n";
@@ -193,7 +240,8 @@ void benchmark_invoke_overhead(const ExperimentParams& params) {
         if (t > 0) valid_times.push_back(t);
     }
 
-    print_stats(valid_times, "GPU invoke() overhead");
+    print_stats(valid_times, params.lanes > 0 ? "GPU invoke_lane_masked() overhead per call"
+                                              : "GPU invoke() overhead");
 
     // Cleanup
     KIWI_HIP_CHECK(hipFree(d_invoke_times));
@@ -213,9 +261,13 @@ void benchmark_invoke_no_backpressure(const ExperimentParams& params) {
     Context ctx(1, params.queue_capacity);
 
     // One-line messages: only capacity-1 fit before blocking
-    int num_msgs = params.queue_capacity - 1;
+    int num_msgs = (params.queue_capacity - 1) / params.per_call();
     int warmup_msgs = std::min(100, num_msgs / 10);
     int measured_msgs = num_msgs - warmup_msgs;
+    if (measured_msgs <= 0) {
+        std::cerr << "ERROR: the ring holds no measured call; raise --capacity\n";
+        exit(1);
+    }
 
     // Register dummy callback
     std::function<void(uint32_t)> callback = [](uint32_t) {};
@@ -227,9 +279,8 @@ void benchmark_invoke_no_backpressure(const ExperimentParams& params) {
     KIWI_HIP_CHECK(hipMemset(d_invoke_times, 0, measured_msgs * sizeof(uint64_t)));
 
     // Run kernel - no consumer needed since queue won't fill
-    require_no_scratch(timed_invoke_kernel, "timed_invoke_kernel");
-    timed_invoke_kernel<<<1, 64>>>(ctx.device_context(), callback_id, num_msgs,
-                                    d_invoke_times, warmup_msgs);
+    launch_timed(params, ctx.device_context(), callback_id, num_msgs, d_invoke_times, warmup_msgs,
+                 nullptr);
     KIWI_HIP_CHECK(hipDeviceSynchronize());
 
     // Copy timing results back
@@ -248,7 +299,9 @@ void benchmark_invoke_no_backpressure(const ExperimentParams& params) {
         if (t > 0) valid_times.push_back(t);
     }
 
-    print_stats(valid_times, "GPU invoke() overhead (no backpressure)");
+    print_stats(valid_times, params.lanes > 0
+                                 ? "GPU invoke_lane_masked() overhead per call (no backpressure)"
+                                 : "GPU invoke() overhead (no backpressure)");
 
     // Cleanup
     KIWI_HIP_CHECK(hipFree(d_invoke_times));
@@ -321,11 +374,22 @@ int main(int argc, char** argv) {
                    "Warmup iterations (default: auto = 10% of messages, max 1000)")
         ->default_val(-1);
 
+    app.add_option("--lanes", params.lanes,
+                   "Time invoke_lane_masked() with this many active lanes (0: invoke())")
+        ->default_val(0)
+        ->check(CLI::Range(0, 64));
+
     app.add_flag("-v,--verbose", params.verbose,
                  "Verbose output");
 
     // Parse command line
     CLI11_PARSE(app, argc, argv);
+    if (params.lanes > params.queue_capacity) {
+        std::cerr << "ERROR: one invoke_lane_masked() call takes " << params.lanes
+                  << " lines, more than a " << params.queue_capacity
+                  << "-line ring holds; raise --capacity\n";
+        return 1;
+    }
 
     // Print configuration
     std::cout << "invoke Operation Overhead Benchmark\n";
@@ -337,8 +401,8 @@ int main(int argc, char** argv) {
     // Second: invoke overhead with active consumer (steady state)
     benchmark_invoke_overhead(params);
 
-    // Third: inter-arrival time on CPU
-    benchmark_inter_arrival(params);
+    // Third: inter-arrival time on CPU (invoke() only)
+    if (params.lanes == 0) benchmark_inter_arrival(params);
 
     return 0;
 }

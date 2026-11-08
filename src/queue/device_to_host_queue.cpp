@@ -17,7 +17,6 @@ Queue<Direction::DeviceToHost, Concurrency::SPSC>::Queue(size_t capacity)
     : capacity_(capacity)
     , log2_capacity_(capacity == 0 ? 0 : __builtin_ctzll(capacity))
     , capacity_mask_(capacity - 1)
-    , publish_interval_(detail::publish_interval(capacity))
     , chunks_(detail::allocate_ring(capacity))
     , consumer_index_(nullptr)
     , head_(0)
@@ -38,8 +37,8 @@ Queue<Direction::DeviceToHost, Concurrency::SPSC>::~Queue() {
 
 bool Queue<Direction::DeviceToHost, Concurrency::SPSC>::pop(void* buf, uint32_t* metadata,
                                                             size_t* bytes) {
-    return detail::pop_message(chunks_, capacity_mask_, log2_capacity_, publish_interval_, head_,
-                               consumer_index_, buf, metadata, bytes);
+    return detail::pop_message(chunks_, capacity_mask_, log2_capacity_, head_, consumer_index_,
+                               buf, metadata, bytes);
 }
 
 Queue<Direction::DeviceToHost, Concurrency::SPSC>::DeviceHandle

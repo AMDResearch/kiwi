@@ -37,12 +37,26 @@ Use `#include <kiwi/queue/queue.hpp>` for the queue API. Canonical aliases are:
 Core invariants:
 
 - Capacity is a non-zero power of two.
-- Device queue operations are wavefront-cooperative and use a 64-thread wavefront.
+- Device queue operations are wavefront-cooperative and use a 64-thread
+  wavefront.
 - Both D2H queues use a 16-byte chunk wire format (LL8: per lane two halves
   of 4 B payload + 4 B signal, messages up to 512 B, capacity in 64-byte
   lines) and one push
-  API: `push_reg`, `push_shared`, `push_global`, `push_lanes`.
-  No push path may use scratch (`test_queue_push_isa`).
+  API: `push_reg`, `push_shared`, `push_global`, `push_lanes`, and
+  `push_lane_masked` (each active lane pushes its own message). invoke
+  mirrors it: `invoke`, `invoke_shared`, `invoke_lane_masked`.
+  No push path may use scratch (`test_queue_push_isa`), except that
+  `push_lane_masked` spills large per-lane messages: from 512 B, or from
+  192 B inside an SPSC retry loop, with the default launch bounds
+  (`docs/core.md`). SPSC pushes use no atomics.
+- `push_lane_masked` is wave-collective too: all 64 lanes call it from
+  converged code with a per-lane `active` flag. A call is all-or-nothing
+  like `push_lanes` (SPSC returns `false` when short; MPSC waits), and a
+  call longer than the ring (`capacity` lines) traps. Lanes on the two
+  sides of a divergent branch are concurrent threads to the compiler, so
+  they must never share per-lane producer state through plain loads and
+  stores, and the SPSC producer index is a register every lane must keep
+  equal.
 - H2D queues use 64-byte wave-slots with 56 payload bytes; lane 7 is an epoch
   or sequence.
 - H2D device consumers call `flush_consumer_index()` before returning.

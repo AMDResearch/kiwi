@@ -7,7 +7,12 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
+#include <string>
+
+#include <unistd.h>
 
 namespace {
 
@@ -89,6 +94,75 @@ int main() {
     require_defaults(64, 4, 64, rcomp_backend_t::HYBRID);
     require_defaults(65, 32, 256, rcomp_backend_t::HYBRID);
 
+    const auto require_tuned = [](
+            int num_tokens, int world_size, int num_blocks,
+            rcomp_backend_t rcomp_backend) {
+        const auto defaults = recommended_runtime_defaults(
+            num_tokens, world_size, "gfx950", "pollara");
+        REQUIRE(defaults.num_blocks == num_blocks);
+        REQUIRE(defaults.rcomp_backend == rcomp_backend);
+    };
+    require_tuned(1, 8, 12, rcomp_backend_t::HYBRID);
+    // Between measured rows, the next larger row applies.
+    require_tuned(3, 8, 16, rcomp_backend_t::HYBRID);
+    require_tuned(16, 16, 64, rcomp_backend_t::HYBRID);
+    require_tuned(64, 32, 64, rcomp_backend_t::HYBRID);
+    // Unmeasured token counts and world sizes use the generic rule.
+    require_tuned(65, 8, 256, rcomp_backend_t::HYBRID);
+    require_tuned(1, 64, 12, rcomp_backend_t::RDMA_ONLY);
+    REQUIRE(recommended_runtime_defaults(1, 8, "gfx942", "pollara")
+                .rcomp_backend == rcomp_backend_t::RDMA_ONLY);
+    // gfx942/CX7 matches the generic rule at its measured rows; between rows
+    // the next larger row applies.
+    REQUIRE(recommended_runtime_defaults(4, 8, "gfx942", "cx7").rcomp_backend
+            == rcomp_backend_t::RDMA_ONLY);
+    REQUIRE(recommended_runtime_defaults(5, 8, "gfx942", "cx7").rcomp_backend
+            == rcomp_backend_t::HYBRID);
+    REQUIRE(recommended_runtime_defaults(3, 16, "gfx942", "cx7").rcomp_backend
+            == rcomp_backend_t::HYBRID);
+    REQUIRE(recommended_runtime_defaults(65, 16, "gfx942", "cx7").num_blocks
+            == 256);
+    REQUIRE(recommended_runtime_defaults(1, 8, "gfx950", "cx7")
+                .rcomp_backend == rcomp_backend_t::RDMA_ONLY);
+
+    // Contexts provision for the capacity launch, so no smaller token count
+    // may need more blocks or switch from hybrid back to rdma-only.
+    const auto require_monotonic = [](const char* gpu_arch,
+                                      const char* nic_family) {
+        for (int world_size : {2, 4, 8, 16, 32, 64}) {
+            auto previous = recommended_runtime_defaults(
+                1, world_size, gpu_arch, nic_family);
+            for (int num_tokens = 2; num_tokens <= 4096; ++num_tokens) {
+                const auto current = recommended_runtime_defaults(
+                    num_tokens, world_size, gpu_arch, nic_family);
+                REQUIRE(current.num_blocks >= previous.num_blocks);
+                REQUIRE(previous.rcomp_backend == rcomp_backend_t::RDMA_ONLY
+                        || current.rcomp_backend == rcomp_backend_t::HYBRID);
+                previous = current;
+            }
+        }
+    };
+    require_monotonic("", "");
+    for (size_t i = 0; i < kiwi::ep::kNumRuntimeTuningTables; ++i) {
+        const auto* table = kiwi::ep::kRuntimeTuningTables[i];
+        require_monotonic(table->gpu_arch, table->nic_family);
+    }
+
+    const std::filesystem::path sysfs_root =
+        std::filesystem::temp_directory_path()
+        / ("kiwi_ep_sysfs_" + std::to_string(::getpid()));
+    const std::filesystem::path mlx5_device = sysfs_root / "mlx5_0/device";
+    std::filesystem::create_directories(mlx5_device);
+    std::ofstream(mlx5_device / "vendor") << "0x15b3\n";
+    std::ofstream(mlx5_device / "device") << "0x1021\n";
+    REQUIRE(kiwi::ep::nic_family_for_hca("mlx5_0", sysfs_root) == "cx7");
+    std::ofstream(mlx5_device / "device") << "0x101d\n";
+    REQUIRE(kiwi::ep::nic_family_for_hca("mlx5_0", sysfs_root) == "mlx5");
+    REQUIRE(kiwi::ep::nic_family_for_hca("mlx5_1", sysfs_root) == "mlx5");
+    REQUIRE(kiwi::ep::nic_family_for_hca("ionic_3", sysfs_root) == "pollara");
+    REQUIRE(kiwi::ep::nic_family_for_hca("", sysfs_root).empty());
+    std::filesystem::remove_all(sysfs_root);
+
     kiwi::ep::config_t automatic;
     automatic.world_size = 16;
     automatic.max_num_inp_token_per_rank = 4096;
@@ -122,6 +196,16 @@ int main() {
     REQUIRE(fixed.launch_policy_for(4096).rcomp_backend
             == rcomp_backend_t::RDMA_ONLY);
     REQUIRE(!fixed.rcomp_ipc_resources_required());
+
+    kiwi::ep::config_t tuned = automatic;
+    tuned.max_num_inp_token_per_rank = 32;
+    tuned.gpu_arch = "gfx950";
+    tuned.nic_family = "pollara";
+    REQUIRE(tuned.provisioned_num_blocks() == 64);
+    REQUIRE(tuned.rcomp_ipc_resources_required());
+    REQUIRE(tuned.launch_policy_for(1).num_blocks == 16);
+    REQUIRE(tuned.launch_policy_for(1).rcomp_backend
+            == rcomp_backend_t::HYBRID);
 
     kiwi::ep::config_t automatic_small_capacity;
     automatic_small_capacity.world_size = 16;

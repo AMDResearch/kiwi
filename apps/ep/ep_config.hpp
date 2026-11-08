@@ -8,6 +8,8 @@
 #include <string>
 #include <stdexcept>
 
+#include "ep_tuning.hpp"
+
 #ifndef KIWI_EP_HOST_DEVICE
 #if defined(__HIPCC__) || defined(__HIP_DEVICE_COMPILE__) \
     || defined(__CUDACC__) || (defined(__host__) && defined(__device__))
@@ -46,16 +48,6 @@ enum class quant_format_t : int32_t {
     FP4 = 2,
 };
 
-// RCOMP payload backend. RDMA_ONLY uses RDMA payloads; HYBRID writes
-// exact-hostname-local peer payloads through HIP IPC and retains RDMA payloads
-// plus receiver-owned readiness signals for all other peers. AUTO resolves the
-// concrete backend independently for each active-token launch.
-enum class rcomp_backend_t : int32_t {
-    RDMA_ONLY = 0,
-    HYBRID = 1,
-    AUTO = 2,
-};
-
 // Every caller uses this as a byte offset into the flag region: added to a
 // uint8_t* base, or multiplied by sizeof(uint8_t) before being added to a
 // displacement. Scaling the flattened slot index by
@@ -67,57 +59,6 @@ KIWI_EP_HOST_DEVICE inline size_t payload_readiness_flag_index(
          * static_cast<size_t>(slots_per_rank)
          + static_cast<size_t>(source_local_slot))
          * KIWI_EP_READINESS_FLAG_STRIDE;
-}
-
-struct runtime_defaults_t {
-    int num_blocks;
-    rcomp_backend_t rcomp_backend;
-};
-
-// Return the measured runtime defaults for a positive per-rank token count and
-// world size. Context construction uses the maximum configured capacity to
-// allocate enough queues and optional hybrid resources. Automatic dispatch
-// and combine policy can then select a smaller launch from the active token
-// count without changing those allocations.
-//
-// The common block bands combine a BF16 single-node (MI300X) one-token result,
-// 1/2/4/8-node small-token sweeps, and the existing high-token bands. ws8 uses its measured backend threshold; every other topology uses
-// the ws16-derived fallback threshold.
-inline runtime_defaults_t recommended_runtime_defaults(
-        int num_tokens, int world_size) {
-    if (num_tokens <= 0) {
-        throw std::invalid_argument(
-            "kiwi::ep::recommended_runtime_defaults: "
-            "num_tokens must be positive");
-    }
-
-    const int num_blocks =
-        num_tokens == 1 ? 12
-        : num_tokens == 2 ? 20
-        : num_tokens <= 32 ? 32
-        : num_tokens <= 64 ? 64
-                           : 256;
-
-    const int hybrid_min_tokens = world_size == 8 ? 8 : 4;
-    return {
-        num_blocks,
-        num_tokens >= hybrid_min_tokens
-            ? rcomp_backend_t::HYBRID
-            : rcomp_backend_t::RDMA_ONLY,
-    };
-}
-
-inline int recommended_num_blocks(int num_tokens, int world_size) {
-    return recommended_runtime_defaults(num_tokens, world_size).num_blocks;
-}
-
-inline const char* rcomp_backend_name(rcomp_backend_t backend) {
-    switch (backend) {
-    case rcomp_backend_t::RDMA_ONLY: return "rdma-only";
-    case rcomp_backend_t::HYBRID: return "hybrid";
-    case rcomp_backend_t::AUTO: return "auto";
-    }
-    return "unknown";
 }
 
 // Wire-format layout for one MORI-style communication slot.  Dispatch and
@@ -235,6 +176,11 @@ struct config_t {
     // Optional LCI HCA/NIC name. This is consumed only by the first KIWI
     // context that initializes the per-process LCI runtime.
     std::string device_name;
+    // Hardware key for the automatic num_blocks/rcomp_backend tuning tables
+    // in ep_tuning.hpp. ep_context_t detects empty fields from the current
+    // HIP device and the LCI HCA; set them to override detection.
+    std::string gpu_arch;
+    std::string nic_family;
     int dispatch_elem_size = 4;    // bytes per dispatch hidden element
     int combine_elem_size = 4;     // bytes per combine hidden element
     quant_format_t dispatch_quant_format = quant_format_t::NONE;
@@ -255,12 +201,13 @@ struct config_t {
         return num_blocks == 0;
     }
     // Number of blocks provisioned at construction. Automatic mode derives
-    // this directly from the configured maximum input capacity; explicit mode
-    // keeps its fixed launch count.
+    // this directly from the configured maximum input capacity, which is
+    // enough because recommended num_blocks never decreases with token count
+    // (test_ep_block_count); explicit mode keeps its fixed launch count.
     int provisioned_num_blocks() const {
         return uses_automatic_num_blocks()
-            ? recommended_num_blocks(
-                  max_num_inp_token_per_rank, world_size)
+            ? recommended_num_blocks(max_num_inp_token_per_rank, world_size,
+                                     gpu_arch, nic_family)
             : num_blocks;
     }
     // Number of invoke SPSC queues: one per producer wavefront. Derived
@@ -276,7 +223,8 @@ struct config_t {
     }
     runtime_defaults_t launch_policy_for(int active_num_tokens) const {
         runtime_defaults_t policy = recommended_runtime_defaults(
-            active_num_tokens > 0 ? active_num_tokens : 1, world_size);
+            active_num_tokens > 0 ? active_num_tokens : 1, world_size,
+            gpu_arch, nic_family);
         if (!uses_automatic_num_blocks()) {
             policy.num_blocks = num_blocks;
         }
@@ -287,13 +235,15 @@ struct config_t {
     }
     // Automatic payload routing can select either backend across token
     // buckets. Provision HIP-IPC payload resources whenever any bucket up to
-    // capacity selects hybrid; explicit backend selection remains fixed.
+    // capacity selects hybrid, which the capacity bucket does if any does
+    // (test_ep_block_count); explicit backend selection remains fixed.
     bool rcomp_ipc_resources_required() const {
         if (rcomp_backend != rcomp_backend_t::AUTO) {
             return rcomp_backend == rcomp_backend_t::HYBRID;
         }
         return recommended_runtime_defaults(
-                   max_num_inp_token_per_rank, world_size).rcomp_backend
+                   max_num_inp_token_per_rank, world_size,
+                   gpu_arch, nic_family).rcomp_backend
             == rcomp_backend_t::HYBRID;
     }
 

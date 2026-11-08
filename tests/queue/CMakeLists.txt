@@ -21,6 +21,9 @@ add_hip_test(test_queue_wavefront_atomicity test_wavefront_atomicity.hip.cpp)
 # Device-to-host chunk format and push paths, on both D2H queues
 add_hip_test(test_queue_chunk test_chunk_queue.hip.cpp)
 
+# Lane-masked device-to-host pushes (push_lane_masked), on both D2H queues
+add_hip_test(test_queue_push_lane_masked test_push_lane_masked.hip.cpp)
+
 # GPU cache latency characterization (standalone, no gtest)
 add_hip_standalone_test(test_queue_cache_latency test_cache_latency.hip.cpp)
 

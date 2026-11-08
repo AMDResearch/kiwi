@@ -283,7 +283,8 @@ public:
 
     // Spawn proxy/progress threads. If first_core >= 0, proxy thread i
     // pins itself to CPU core first_core + i. Otherwise threads use the
-    // automatic GPU-local affinity policy when available.
+    // GPU-local CPUs in the process affinity mask (see
+    // topology::proxy_thread_cpu_set()).
     void spawn_proxy_threads(int num_threads = -1, int first_core = -1);
     void join_proxy_threads();
 
@@ -319,7 +320,7 @@ private:
     void wait_drained();
 
     void proxy_thread_func(int thread_id, int num_proxy_threads,
-                           int selected_cpu);
+                           std::vector<int> cpus);
 
     int num_queues;
     int num_devices;

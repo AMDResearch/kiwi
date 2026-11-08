@@ -61,21 +61,20 @@ cmake .. \
 `kiwi_ep` uses the RCOMP payload protocol. In automatic mode, context
 construction provisions endpoints and optional HIP IPC resources from the
 maximum token capacity, while each dispatch and combine selects its grid and
-payload backend from that call's active token count. The generic block schedule
-remains 12 blocks at one token, 20 at two, 32 from 3 through 32, 64 from 33
-through 64, and 256 above 64. The Python benchmark detects the GPU architecture
-and HCA family and loads a matching JSON tuning file when available. The
-`gfx950_pollara_runtime.json` table records these monotonic schedules for active
-token counts `1/2/4/8/16/32/64`: `12/12/16/32/48/48/64` at
-ws8, `16/24/24/48/64/64/64` at ws16, and `12/20/24/24/24/32/64` at ws32,
-with `hybrid` selected for every measured cell. Missing tables and unmeasured
-world sizes retain the generic C++ schedule and backend thresholds: ws8 selects
-`rdma-only` below 8 active tokens and `hybrid` at 8 or more, while the
-ws16-derived fallback selects `rdma-only` below 4 and `hybrid` at 4 or more.
-The corresponding MI300X/ConnectX-7 recommendations are stored in
-`gfx942_cx7_runtime.json`; ConnectX-7 is identified from its Mellanox PCI
-device ID rather than from the generic `mlx5_*` HCA name alone.
-Pollara uses the `ionic_*` HCA names, which the tuning lookup maps to `pollara`.
+payload backend from that call's active token count. The lookup lives in
+`apps/ep/ep_tuning.hpp`, with one measured table per GPU architecture and NIC
+family under `apps/ep/tuning/` (currently `gfx942_cx7.cpp` and
+`gfx950_pollara.cpp`). Context construction detects the GPU architecture from
+the HIP device and the NIC family from `config_t::device_name` or the HCA
+nearest the GPU, unless `config_t::gpu_arch` and `config_t::nic_family` are
+set. `ionic_*` HCAs map to `pollara`; ConnectX-7 is identified from its
+Mellanox PCI device ID rather than the generic `mlx5_*` name. A matching table
+applies to the world sizes and active token counts it measured, and a token
+count between two rows uses the larger row. Everything else uses the generic
+schedule: 12 blocks at one token, 20 at two, 32 from 3 through 32, 64 from 33
+through 64, and 256 above 64; ws8 selects `rdma-only` below 8 active tokens and
+`hybrid` at 8 or more, while other world sizes select `rdma-only` below 4 and
+`hybrid` at 4 or more.
 Explicit `num_blocks` and `rcomp_backend` settings remain fixed, and native
 `config_t` defaults remain explicit 4-block, `rdma-only` settings. Raw proxy
 devices explicitly disable LCI SHM and have no packet pool; high-level setup
@@ -131,7 +130,10 @@ Symmetric heap registration is collective across ranks and should be done before
 For latency experiments that need a dedicated proxy core, call
 `ctx.spawn_proxy_threads(/*num_threads=*/1, /*first_core=*/49)` after pinning
 the main/control thread separately. When `first_core >= 0`, proxy thread `i`
-pins itself to `first_core + i` and logs the requested and actual CPU.
+pins itself to `first_core + i`. Otherwise, as in EP, proxy threads are bound
+to the GPU's PCI-local CPUs within the process affinity mask (keeping the
+inherited mask when they do not intersect) and the scheduler places them
+within that set. `KIWI_PROXY_AFFINITY_DEBUG=1` logs the chosen and actual CPUs.
 
 ## Tests
 

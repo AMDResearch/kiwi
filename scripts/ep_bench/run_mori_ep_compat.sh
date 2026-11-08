@@ -62,7 +62,9 @@ PROFILES=()
 TEST_ARGS=()
 MASTER_ADDR=${MASTER_ADDR:-127.0.0.1}
 MASTER_PORT=${MASTER_PORT:-29570}
-MPIRUN=${MPIRUN:-mpirun}
+MPIRUN=${MPIRUN:-$EP_BENCH_DEFAULT_MPIRUN}
+# shellcheck disable=SC2206
+mpirun_cmd=($MPIRUN)
 PYTHON=${PYTHON:-python3}
 DRY_RUN=${DRY_RUN:-0}
 
@@ -180,7 +182,7 @@ run_one_profile() {
     MORI_SHMEM_VMM_CHUNK_SIZE="${MORI_SHMEM_VMM_CHUNK_SIZE:-64M}"
   )
   cmd+=(
-    "$MPIRUN"
+    "${mpirun_cmd[@]}"
   )
   mapfile -d '' -t root_args < <(ep_bench_mpirun_root_args)
   cmd+=("${root_args[@]}" -np "$PROFILE_WORLD_SIZE")

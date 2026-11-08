@@ -16,22 +16,35 @@
  * credit does not cover the claim, lane 0 waits on the published consumer
  * index (host memory) with s_sleep. A claim cannot be given back, so a push
  * on a full ring waits instead of failing. Lane c then stores chunk c with
- * one 16-byte store, as in the SPSC queue.
+ * one 16-byte store, as in the SPSC queue. push_lane_masked() is the
+ * exception: each active lane pushes its own message, the call claims all of
+ * their lines with one fetch-add, and each lane stores all of its own
+ * message's chunks.
  *
  * Consumer. pop() is the SPSC pop: it keeps its position privately, consumes
  * a message only when every chunk of its lines carries the lap of its own
- * line, and publishes its position in batches. A producer that claimed lines
- * but has not written them yet holds up only the consumer. A claim of line
- * i + capacity waits until the published index passed i, so a line holds
- * either the expected lap or the one before it, as in the SPSC queue.
+ * line, and publishes its position after every pop. A producer that claimed
+ * lines but has not written them yet holds up only the consumer. A claim of
+ * line i + capacity waits until the published index passed i, so a line
+ * holds either the expected lap or the one before it, as in the SPSC queue.
  *
- * Liveness. The published index is at least position - interval + 1, so the
- * producer of the oldest unconsumed message always has credit; claims ahead
- * of it get credit as the consumer moves on.
+ * Liveness, with a running consumer and any number of producers. A claim,
+ * collective or lane-masked, takes at most `capacity` lines (a longer one
+ * traps before claiming), and the fetch-add orders all claims. Every claim
+ * before the oldest unwritten one is written, so the consumer pops up to
+ * that claim's first line and publishes exactly that position; its producer,
+ * which is running since it made the claim, then has credit for the whole
+ * claim and writes it. By induction every claim is written: a waiting claim
+ * depends only on older claims, never on a newer one.
  *
- * Ordering. Messages are popped in claim order. Lane 0 of a wavefront claims
- * in program order, so one wavefront's messages are popped in program order;
- * messages of different wavefronts interleave.
+ * Ordering. Messages are popped in claim order. Every claim of a wavefront,
+ * collective or lane-masked, is one relaxed fetch-add by lane 0, so a
+ * wavefront's claims follow lane 0's program order (one thread's
+ * read-modify-writes of one location are coherence-ordered); this needs no
+ * ordering between atomics of different lanes. One wavefront's messages are
+ * therefore popped in program order, and the active lanes of one
+ * push_lane_masked() call in lane order; messages of different wavefronts
+ * interleave.
  */
 
 #pragma once
@@ -61,8 +74,9 @@ public:
      * All copies share the device-memory producer index, so handles need no
      * write-back between launches. `consumer_index_cached` is a copy's
      * credit cache; any earlier published value is a safe lower bound.
-     * Device operations are wavefront-collective: all 64 lanes call them
-     * with identical arguments.
+     * Device operations are wavefront-collective: all 64 lanes call them,
+     * with identical arguments except push_lane_masked()'s per-lane
+     * arguments.
      */
     struct DeviceHandle : detail::PushApi<DeviceHandle> {
         detail::global_ptr<detail::Chunk> chunks;          ///< ring, extended-scope host memory
@@ -107,6 +121,55 @@ public:
                 consumer_index_cached = detail::broadcast_lane0(fresh);
             }
             detail::write_message(chunks, log2_capacity, base, word, bytes, metadata, lines);
+            return true;
+        }
+
+        /**
+         * @brief Every active lane pushes its own `message`
+         *
+         * The SPSC push_lane_masked() contract: wavefront-collective (all
+         * 64 lanes, converged; debug builds trap otherwise), lanes with
+         * `active` false push nothing and their other arguments' values are
+         * ignored (`message` must still be a valid, readable reference),
+         * `bytes` > sizeof(T) traps, a call whose active lanes need more
+         * lines than the ring holds traps, and the active lanes' messages
+         * take consecutive lines in lane order. Lane 0 claims all of them
+         * with one fetch-add, so they are popped in lane order, after this
+         * wavefront's earlier pushes, and waits as in push_lanes() until the
+         * consumer has freed the whole claim; each lane then stores every
+         * chunk of its own message. Like push_lanes(), it always returns
+         * true, and the handle's credit cache is updated as in it.
+         */
+        template<typename T>
+        __device__ bool push_lane_masked(const T& message, uint32_t bytes, uint32_t metadata,
+                                         bool active) {
+            detail::assert_full_wave();
+            const detail::LaneClaim c =
+                detail::lane_masked_claim<T>(bytes, active, log2_capacity);
+            if (c.total == 0) {
+                return true;  // no active lane: claim nothing
+            }
+            uint64_t base = 0;
+            if (__lane_id() == 0) {
+                base = __hip_atomic_fetch_add(producer_index, c.total, __ATOMIC_RELAXED,
+                                              __HIP_MEMORY_SCOPE_AGENT);
+            }
+            base = detail::broadcast_lane0(base);
+            // The credit wait of push_lanes(), for the whole claim.
+            const uint64_t cap = uint64_t{1} << log2_capacity;
+            if (base + c.total - consumer_index_cached > cap) {
+                uint64_t fresh = 0;
+                if (__lane_id() == 0) {
+                    // The chunk stores below depend on this loop's exit.
+                    while (base + c.total - (fresh = detail::load_published(consumer_index)) >
+                           cap) {
+                        __builtin_amdgcn_s_sleep(1);
+                    }
+                }
+                consumer_index_cached = detail::broadcast_lane0(fresh);
+            }
+            detail::write_lane_message(chunks, log2_capacity, base + c.prefix, message, bytes,
+                                       metadata, c.lines);
             return true;
         }
     };
@@ -159,7 +222,6 @@ private:
     size_t capacity_;           ///< lines
     uint32_t log2_capacity_;
     uint64_t capacity_mask_;
-    uint64_t publish_interval_; ///< lines between consumer index publications
     detail::Chunk* chunks_;     ///< extended-scope host memory, capacity_ * 4 chunks
     uint64_t* producer_index_;  ///< device memory (lines)
     uint64_t* consumer_index_;  ///< extended-scope host memory, published position

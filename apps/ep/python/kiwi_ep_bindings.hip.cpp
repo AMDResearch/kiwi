@@ -389,6 +389,20 @@ public:
     }
     int max_num_tokens_to_send_per_rank() const { return cfg_.max_num_inp_token_per_rank; }
 
+    // Launch policy dispatch/combine select for num_tokens active tokens,
+    // with the tuning-table key the context resolved.
+    py::dict launch_policy(int num_tokens) const {
+        const kiwi::ep::config_t& cfg = ctx_->config();
+        const auto policy = cfg.launch_policy_for(num_tokens);
+        py::dict result;
+        result["num_blocks"] = policy.num_blocks;
+        result["rcomp_backend"] =
+            kiwi::ep::rcomp_backend_name(policy.rcomp_backend);
+        result["gpu_arch"] = cfg.gpu_arch;
+        result["nic_family"] = cfg.nic_family;
+        return result;
+    }
+
     // Inverse of dispatch's d_recv_src_token_pos encoding:
     // src_rank * (world_size * max_num_inp_token_per_rank) + src_token_id.
     py::tuple decode_send_flat_idx(int flat_idx) const {
@@ -558,17 +572,22 @@ PYBIND11_MODULE(kiwi_ep_ext, m) {
           []() { return kiwi::p2p::topology::get_hca_name_for_current_gpu(); },
           "Return the auto-selected active HCA/NIC name for the current HIP GPU, or an empty string.");
     m.def("recommended_num_blocks",
-          [](int num_tokens, int world_size) {
-              return kiwi::ep::recommended_num_blocks(num_tokens, world_size);
+          [](int num_tokens, int world_size, const std::string& gpu_arch,
+             const std::string& nic_family) {
+              return kiwi::ep::recommended_num_blocks(
+                  num_tokens, world_size, gpu_arch, nic_family);
           },
           py::arg("num_tokens"), py::arg("world_size"),
-          "Return the topology-aware EP block-count recommendation. "
-          "Unmeasured world sizes use the legacy default.");
+          py::arg("gpu_arch") = "", py::arg("nic_family") = "",
+          "Return the EP block-count recommendation for gpu_arch/nic_family "
+          "(generic when empty or untuned). KiwiEpOp.launch_policy reports "
+          "what an op actually uses.");
     m.def("recommended_runtime_defaults",
-          [](int num_tokens, int world_size) {
+          [](int num_tokens, int world_size, const std::string& gpu_arch,
+             const std::string& nic_family) {
               const auto defaults =
                   kiwi::ep::recommended_runtime_defaults(
-                      num_tokens, world_size);
+                      num_tokens, world_size, gpu_arch, nic_family);
               py::dict result;
               result["num_blocks"] = defaults.num_blocks;
               result["rcomp_backend"] =
@@ -576,7 +595,10 @@ PYBIND11_MODULE(kiwi_ep_ext, m) {
               return result;
           },
           py::arg("num_tokens"), py::arg("world_size"),
-          "Return the centralized EP block-count and rcomp-backend defaults.");
+          py::arg("gpu_arch") = "", py::arg("nic_family") = "",
+          "Return the EP block-count and rcomp-backend defaults for "
+          "gpu_arch/nic_family (generic when empty or untuned). "
+          "KiwiEpOp.launch_policy reports what an op actually uses.");
 
     // KiwiEpOp
     py::class_<KiwiEpOp>(m, "KiwiEpOp")
@@ -683,6 +705,10 @@ PYBIND11_MODULE(kiwi_ep_ext, m) {
              "combine/combine_send call.")
         .def("reset", &KiwiEpOp::reset,
              "Reset internal state for next dispatch/combine round.")
+        .def("launch_policy", &KiwiEpOp::launch_policy,
+             py::arg("num_tokens"),
+             "Return the dispatch/combine launch policy for num_tokens "
+             "active tokens and the resolved gpu_arch/nic_family.")
         .def("max_num_tokens_to_recv", &KiwiEpOp::max_num_tokens_to_recv)
         .def("max_num_tokens_to_recv_per_rank",
              &KiwiEpOp::max_num_tokens_to_recv_per_rank)

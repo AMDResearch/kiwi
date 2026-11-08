@@ -46,7 +46,6 @@ from kiwi_ep_bench_utils import (
     combine_slot_payload_bytes,
     combine_slot_stride_bytes,
 )
-from kiwi_ep_tuning import recommended_runtime_defaults as tuned_runtime_defaults
 
 
 _E2E_CAPTURE_WARNING_PRINTED = False
@@ -1222,7 +1221,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Kernel grid block count for dispatch/combine; 0 selects the "
-        "topology-aware recommendation, while a positive value overrides it",
+        "library's measured per-GPU/NIC recommendation, while a positive "
+        "value overrides it",
     )
     parser.add_argument("--num-proxy-threads", type=int, default=4, help="Number of CPU proxy threads; one LCI device is allocated per proxy thread (num_devices is derived, not tunable)")
     parser.add_argument("--queue-capacity", type=int, default=2048, help="Per-queue ring size in 64-byte lines (power of two). Messages are line-aligned and a line carries up to 32 B of payload (a put descriptor uses 2 lines, a multicast put 6); each queue costs queue_capacity*64B pinned host memory")
@@ -1231,9 +1231,8 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "rdma-only", "hybrid"],
         default="auto",
         help=(
-            "RCOMP payload backend; auto uses the measured topology-aware "
-            "threshold (hybrid at 8+ max tokens for ws8 and at 4+ for the "
-            "ws16-derived fallback)"
+            "RCOMP payload backend; auto uses the library's measured "
+            "per-GPU/NIC launch policy (apps/ep/ep_tuning.hpp)"
         ),
     )
     parser.add_argument(
@@ -1366,29 +1365,6 @@ def main() -> int:
         raise SystemExit(
             f"--num-experts-per-token ({args.num_experts_per_token}) exceeds total experts ({total_experts})"
         )
-    runtime_defaults = tuned_runtime_defaults(
-        torch,
-        local_rank,
-        lci_device_name or "",
-        world_size,
-        args.max_tokens,
-    )
-    if runtime_defaults is None:
-        runtime_defaults = dict(
-            kiwi_ep_ext.recommended_runtime_defaults(args.max_tokens, world_size)
-        )
-        runtime_defaults["source"] = "generic"
-    tuning_source = str(runtime_defaults["source"])
-    effective_num_blocks = (
-        args.num_blocks
-        if args.num_blocks > 0
-        else int(runtime_defaults["num_blocks"])
-    )
-    effective_rcomp_backend = (
-        args.rcomp_backend
-        if args.rcomp_backend != "auto"
-        else str(runtime_defaults["rcomp_backend"])
-    )
 
     dist, dist_owned, dist_status = maybe_init_torch_dist(torch, rank, world_size, args)
     lci_device_summaries, lci_device_summary_warning = collect_lci_device_summaries(
@@ -1431,12 +1407,9 @@ def main() -> int:
             f"world_size={cfg.world_size}, experts_per_rank={cfg.num_experts_per_rank}, "
             f"topk={cfg.num_experts_per_token}, timing_batch_iters={cfg.graph_replay_iters}, "
             f"warmup={cfg.warmup}, iters={cfg.iters}, "
-            f"num_blocks={effective_num_blocks} "
-            f"({'auto' if args.num_blocks == 0 else 'explicit'}), "
+            f"num_blocks={args.num_blocks or 'auto'}, "
             f"num_proxy_threads={args.num_proxy_threads}, "
-            f"tuning_source={tuning_source}, "
-            f"rcomp_backend={effective_rcomp_backend} "
-            f"({'auto' if args.rcomp_backend == 'auto' else 'explicit'}), "
+            f"rcomp_backend={args.rcomp_backend}, "
             "protocol=rcomp"
         )
         dispatch_payload = slot_payload_bytes(
@@ -1494,7 +1467,7 @@ def main() -> int:
             max_num_inp_token_per_rank=args.max_tokens,
             dispatch_dtype=dispatch_dtype.torch_dtype,
             combine_dtype=combine_dtype.torch_dtype,
-            num_blocks=effective_num_blocks,
+            num_blocks=args.num_blocks,
             num_proxy_threads=args.num_proxy_threads,
             queue_capacity=args.queue_capacity,
             dispatch_elem_size=dispatch_dtype.elem_size,
@@ -1506,8 +1479,16 @@ def main() -> int:
             device_name=lci_device_name or "",
             dispatch_quant_format=quant_format_for_dtype(dispatch_dtype),
             combine_quant_format=quant_format_for_dtype(combine_dtype),
-            rcomp_backend=effective_rcomp_backend,
+            rcomp_backend=args.rcomp_backend,
         )
+        if rank == 0:
+            policy = op.launch_policy(args.max_tokens)
+            print(
+                f"Launch policy: num_blocks={policy['num_blocks']}, "
+                f"rcomp_backend={policy['rcomp_backend']}, "
+                f"gpu_arch={policy['gpu_arch'] or 'unknown'}, "
+                f"nic_family={policy['nic_family'] or 'unknown'}"
+            )
         if args.debug_timing:
             op.set_debug_timing_enabled(True)
         inputs = generate_rank_inputs(torch, cfg)

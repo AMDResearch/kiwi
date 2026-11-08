@@ -15,7 +15,8 @@
  * - Device-to-host: 16-byte chunks per lane, each two halves of 4 B payload
  *   + 4 B signal (LL8),
  *   messages of up to 512 bytes plus 32-bit metadata, and one push API
- *   (push_reg, push_shared, push_global, push_lanes)
+ *   (push_reg, push_shared, push_global, push_lanes, and push_lane_masked,
+ *   where each active lane pushes its own message)
  * - Host-to-device: 64-byte wave-slots (56-byte payload in lanes 0-6)
  * - Full-wavefront (64 threads) cooperative device-side operations
  * - Lap epochs instead of clearing; cached producer/consumer progress to

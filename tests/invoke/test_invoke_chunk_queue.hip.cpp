@@ -6,9 +6,10 @@
 // Queue mechanics (wraparound, push paths, partial messages) are covered by
 // test_queue_chunk; this file checks what invoke adds: argument
 // serialization of 0 to 512 bytes through invoke() and invoke_shared(),
-// handles saved across launches, the message length checked against the
-// registered argument size, the ring-size check at registration, and many
-// waves sharing an MPSC endpoint.
+// per-lane arguments and callback ids through invoke_lane_masked(), handles
+// saved across launches, the message length checked against the registered
+// argument size, the ring-size check at registration, and many waves
+// sharing an MPSC endpoint.
 
 #include <kiwi/invoke/invoke.hpp>
 #include <kiwi/queue/queue.hpp>
@@ -20,6 +21,7 @@
 #include <cstdint>
 #include <functional>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -152,6 +154,137 @@ void run_stream() {
     ASSERT_EQ(hipFree(d_ids), hipSuccess);
 }
 
+/// Whether lane `lane` invokes in call `call` of wave `wave`: every lane, a
+/// third of them, one lane, the odd lanes, or none.
+__host__ __device__ inline bool lane_active(uint32_t wave, uint32_t call, uint32_t lane) {
+    switch (call % 5) {
+        case 0: return true;
+        case 1: return (call / 5 + lane + wave) % 3 == 0;
+        case 2: return lane == (call * 7 + wave) % 64;
+        case 3: return (lane & 1) != 0;
+        default: return false;
+    }
+}
+
+/// Key of the callbacks lane `lane` sends in step `step` of wave `wave`.
+__host__ __device__ inline uint64_t lane_key(uint32_t wave, uint32_t step, uint32_t lane) {
+    return (static_cast<uint64_t>(wave) << 32) | (static_cast<uint64_t>(step) << 6) | lane;
+}
+
+/// Wave w (one per block) sends to endpoint w. Each step makes three
+/// invoke_lane_masked() calls, each retried until it succeeds: (key,
+/// Blob<5>) to one of three callbacks chosen per lane, an Odd (13 bytes),
+/// and no arguments. Inactive lanes pass arguments too; they must be
+/// ignored. Saves the handle for the next launch.
+template <typename DevCtx>
+__global__ void lane_masked_sender(DevCtx* ctx, const uint8_t* ids, uint32_t first, int steps) {
+    const uint32_t wave = blockIdx.x;
+    const uint32_t lane = __lane_id();
+    auto h = ctx->get_device_handle();
+    for (uint32_t s = first; s < first + steps; ++s) {
+        const uint64_t key = lane_key(wave, s, lane);
+        while (!h.invoke_lane_masked(ids[lane % 3], lane_active(wave, 3 * s, lane), key,
+                                     make_blob<5>(key))) {}
+        while (!h.invoke_lane_masked(ids[3], lane_active(wave, 3 * s + 1, lane),
+                                     Odd{static_cast<uint8_t>(key), static_cast<uint32_t>(key),
+                                         key})) {}
+        while (!h.invoke_lane_masked(ids[4], lane_active(wave, 3 * s + 2, lane))) {}
+    }
+    ctx->save_device_handle(wave, h);
+}
+
+/// Callbacks one endpoint ran, as (callback index, key), and bad arguments.
+struct LaneLog {
+    std::vector<std::pair<int, uint64_t>> seen;
+    uint64_t errors = 0;
+};
+
+/// Four endpoints in 256-line rings (one call of 64 two-line messages takes
+/// 128 lines, so calls wait for credit), three launches that resume from the
+/// saved handles. Every endpoint must run exactly the active lanes'
+/// callbacks, in order (lane order within a call), with their exact
+/// arguments.
+template <typename Q>
+void run_lane_masked() {
+    constexpr uint32_t kEndpoints = 4;
+    constexpr int kSteps = 60, kLaunches = 3;
+    kiwi::invoke::Context<Q> ctx(kEndpoints, 256);
+    std::vector<LaneLog> logs(kEndpoints);
+    LaneLog* cur = nullptr;
+    LaneLog** r = &cur;
+    uint8_t ids[5];
+    for (int c = 0; c < 3; ++c) {
+        ids[c] = ctx.template register_callback<uint64_t, Blob<5>>(
+            std::function<void(uint64_t, Blob<5>)>([r, c](uint64_t key, Blob<5> b) {
+                bool ok = true;
+                for (int k = 0; k < 5; ++k) ok = ok && b.w[k] == key * 1000 + k;
+                (*r)->errors += !ok;
+                (*r)->seen.emplace_back(c, key);
+            }));
+    }
+    ids[3] = ctx.template register_callback<Odd>(std::function<void(Odd)>([r](Odd o) {
+        (*r)->errors += o.a != static_cast<uint8_t>(o.c) || o.b != static_cast<uint32_t>(o.c);
+        (*r)->seen.emplace_back(3, o.c);
+    }));
+    ids[4] = ctx.template register_callback<>(
+        std::function<void()>([r] { (*r)->seen.emplace_back(4, 0); }));
+    uint8_t* d_ids;
+    ASSERT_EQ(hipMalloc(&d_ids, sizeof(ids)), hipSuccess);
+    ASSERT_EQ(hipMemcpy(d_ids, ids, sizeof(ids), hipMemcpyHostToDevice), hipSuccess);
+
+    std::vector<std::vector<std::pair<int, uint64_t>>> want(kEndpoints);
+    for (uint32_t e = 0; e < kEndpoints; ++e) {
+        for (uint32_t s = 0; s < kSteps * kLaunches; ++s) {
+            for (uint32_t c = 0; c < 3; ++c) {
+                for (uint32_t lane = 0; lane < 64; ++lane) {
+                    if (!lane_active(e, 3 * s + c, lane)) continue;
+                    const uint64_t key = lane_key(e, s, lane);
+                    want[e].emplace_back(c == 0 ? lane % 3 : c + 2, c == 2 ? 0 : key);
+                }
+            }
+        }
+    }
+
+    for (int launch = 0; launch < kLaunches; ++launch) {
+        const uint32_t first = static_cast<uint32_t>(launch * kSteps);
+        // Callbacks expected once this launch is done.
+        std::vector<size_t> target(kEndpoints);
+        for (uint32_t e = 0; e < kEndpoints; ++e) {
+            size_t n = 0;
+            for (uint32_t s = 0; s < first + kSteps; ++s) {
+                for (uint32_t c = 0; c < 3; ++c) {
+                    for (uint32_t lane = 0; lane < 64; ++lane) n += lane_active(e, 3 * s + c, lane);
+                }
+            }
+            target[e] = n;
+        }
+        lane_masked_sender<<<kEndpoints, 64>>>(ctx.device_context(), d_ids, first, kSteps);
+        ASSERT_EQ(hipGetLastError(), hipSuccess);
+        auto last = std::chrono::steady_clock::now();
+        for (uint32_t done = 0; done < kEndpoints;) {
+            done = 0;
+            for (uint32_t e = 0; e < kEndpoints; ++e) {
+                if (logs[e].seen.size() >= target[e]) {
+                    ++done;
+                    continue;
+                }
+                cur = &logs[e];
+                if (ctx.progress(e) > 0) last = std::chrono::steady_clock::now();
+            }
+            ASSERT_LT(std::chrono::steady_clock::now() - last, std::chrono::seconds(20))
+                << "timed out in launch " << launch;
+        }
+        ASSERT_EQ(hipDeviceSynchronize(), hipSuccess);
+    }
+    for (uint32_t e = 0; e < kEndpoints; ++e) {
+        cur = &logs[e];
+        EXPECT_EQ(ctx.progress(e), 0u);
+        EXPECT_EQ(logs[e].errors, 0u) << "endpoint " << e;
+        EXPECT_TRUE(logs[e].seen == want[e]) << "endpoint " << e << ": callbacks out of order";
+    }
+    ASSERT_EQ(hipFree(d_ids), hipSuccess);
+}
+
 template <typename DevCtx>
 __global__ void mislabeled_sender(DevCtx* ctx, uint8_t cb) {
     auto h = ctx->get_device_handle(0);
@@ -167,6 +300,13 @@ using Queues = ::testing::Types<kiwi::queue::SPSCD2HQueue, kiwi::queue::MPSCD2HQ
 TYPED_TEST_SUITE(InvokeChunkQueue, Queues);
 
 TYPED_TEST(InvokeChunkQueue, MixedArgumentsRelaunchWithSavedHandles) { run_stream<TypeParam>(); }
+
+// invoke_lane_masked(): per-lane arguments and callback ids, inactive lanes,
+// back-pressure (SPSC calls return false and are retried), and relaunch with
+// saved handles.
+TYPED_TEST(InvokeChunkQueue, LaneMaskedPerLaneArgumentsAndCallbacks) {
+    run_lane_masked<TypeParam>();
+}
 
 // Messages carry their length: a 16-byte message sent to a callback
 // registered for 24 bytes is rejected instead of being read past its end. The

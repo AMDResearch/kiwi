@@ -4,8 +4,8 @@
 /**
  * @file test_chunk_queue.hip.cpp
  * @brief Device-to-host queues (SPSC and MPSC): chunk format, every push
- *        path, wraparound, batched publication, backpressure, late chunks,
- *        and many-producer MPSC stress
+ *        path, wraparound, consumer index publication, backpressure, late
+ *        chunks, and many-producer MPSC stress
  *
  * Every stream checks each popped message's length, metadata, payload and
  * that pop() wrote exactly `bytes` bytes of the caller's buffer,
@@ -318,15 +318,14 @@ TYPED_TEST(ChunkQueue, EverySizeEveryPathEveryRing) {
 
 // Many producer waves, one consumer, small rings and many laps: producers
 // wait for credit and claims wrap the ring at every line offset. A 1-line
-// ring makes every claim wait for the previous message's pop; a 64-line ring
-// publishes every 32 lines (batched credit).
+// ring makes every claim wait for the previous message's pop.
 TEST(MpscD2HStress, ManyProducersOneConsumer) {
     const Stream runs[] = {
         {16, 1, 400, 1, 1, false},       // 1-line ring, one-line messages only
         {8, 2, 400, 2, 1, false},
         {16, 1, 1000, 16, 1, false},     // 16 waves, 1 per block
         {8, 4, 1000, 16, 2, false},      // 32 waves, 4 per block, relaunched
-        {8, 4, 1000, 64, 1, false},      // batched publication
+        {8, 4, 1000, 64, 1, false},      // 64-line ring
         {304, 1, 100, 32, 1, false},     // a wave on every MI300X CU
         {64, 4, 40, 1024, 1, false},     // 256 waves
         {8, 1, 1000, 16, 4, false, true},  // four launches running at once
@@ -334,31 +333,31 @@ TEST(MpscD2HStress, ManyProducersOneConsumer) {
     for (const Stream& r : runs) run<MPSCD2HQueue>(r);
 }
 
-// A 128-line ring publishes its consumer index every 64 lines. The SPSC
-// device_handle() publishes the exact position; an MPSC handle starts from
-// the published index.
-TYPED_TEST(ChunkQueue, PublishesConsumerIndexInBatches) {
-    TypeParam q(128);
+// The consumer publishes its position after every pop, multi-line messages
+// included, so the published index always equals it, and a failed pop
+// publishes nothing. A new device handle starts there on both queues.
+TYPED_TEST(ChunkQueue, PublishesConsumerIndexOnEveryPop) {
+    constexpr int kMsgs = 40;  // 1- to 16-line messages, at most 640 lines
+    TypeParam q(1024);
     uint64_t* rows = nullptr;
     HIP_OK(hipMalloc(&rows, kMaxWords * sizeof(uint64_t)));
     const auto h = q.device_handle();
-    producer_kernel<<<1, 64>>>(h, 0, 0, 100, 1, rows);  // one-line messages
+    producer_kernel<<<1, 64>>>(h, 0, 0, kMsgs, 16, rows);
     HIP_OK(hipDeviceSynchronize());
     HIP_OK(hipFree(rows));
-    uint8_t buf[kMaxMessageBytes];
-    for (int i = 0; i < 63; ++i) ASSERT_TRUE(q.pop(buf));
     EXPECT_EQ(published_index(h), 0u);
-    ASSERT_TRUE(q.pop(buf));
-    EXPECT_EQ(published_index(h), 64u);
-    for (int i = 64; i < 100; ++i) ASSERT_TRUE(q.pop(buf));
-    if constexpr (std::is_same_v<TypeParam, SPSCD2HQueue>) {
-        EXPECT_EQ(published_index(h), 64u);
-        EXPECT_EQ(q.device_handle().consumer_index_cached, 100u);
-        EXPECT_EQ(published_index(h), 100u);
-    } else {
-        EXPECT_EQ(q.device_handle().consumer_index_cached, 64u);
-        EXPECT_EQ(published_index(h), 64u);
+    uint8_t buf[kMaxMessageBytes];
+    uint64_t position = 0;
+    for (int i = 0; i < kMsgs; ++i) {
+        size_t bytes = 0;
+        ASSERT_TRUE(q.pop(buf, nullptr, &bytes));
+        position += message_lines(bytes);
+        EXPECT_EQ(published_index(h), position) << i;
     }
+    EXPECT_GT(position, static_cast<uint64_t>(kMsgs));  // multi-line messages too
+    EXPECT_FALSE(q.pop(buf));
+    EXPECT_EQ(published_index(h), position);
+    EXPECT_EQ(q.device_handle().consumer_index_cached, position);
 }
 
 namespace {

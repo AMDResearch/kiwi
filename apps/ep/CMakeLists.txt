@@ -5,6 +5,9 @@ set(KIWI_EP_SOURCES
     comm/context.hip.cpp
     all2all.hip.cpp
     ep_context.hip.cpp
+    ep_tuning.hip.cpp
+    tuning/gfx942_cx7.cpp
+    tuning/gfx950_pollara.cpp
     dispatch.hip.cpp
     combine.hip.cpp
     comm/transport_callbacks.hip.cpp

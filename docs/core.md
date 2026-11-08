@@ -13,14 +13,17 @@ Device-to-host queues carry messages of up to **512 bytes** in **16-byte chunks*
 - SPSC queues with no atomics on the single-producer/single-consumer state.
 - Device-to-host push API (`SPSCD2HQueue`, `MPSCD2HQueue`): `push_reg`,
   `push_shared`, `push_global` and `push_lanes`. Messages are 0 to 512 bytes with 32-bit
-  metadata; no push path uses scratch.
+  metadata; none of these pushes uses scratch.
+- Lane-masked device-to-host pushes (`push_lane_masked`, and
+  `invoke_lane_masked` in invoke): each active lane of the wavefront pushes
+  its own message, all-or-nothing per call. Large per-lane messages may spill
+  to scratch.
 - An MPSC device-to-host queue: producer wavefronts claim lines with one
   device-memory fetch-add per push; the single host consumer is the SPSC one.
 - MPMC host-to-device queues using atomic slot claiming and Vyukov-style
   sequence numbers.
 - Epoch-based readiness, so slots and lines do not need separate clearing.
-- Cached producer/consumer progress to reduce PCIe traffic on hot paths; the
-  device-to-host consumer publishes its index in batches.
+- Cached producer/consumer progress to reduce PCIe traffic on hot paths.
 - Benchmark and hardware-assumption test suites for MI300X/ROCm systems.
 
 ## Requirements
@@ -109,7 +112,8 @@ Important notes:
   push traps, and `invoke::Context::register_callback()` throws
   `std::invalid_argument` for arguments the rings cannot hold.
 - Device-side operations need a full 64-lane wavefront (wave64 GFX9 target)
-  with every lane passing the same arguments.
+  with every lane passing the same arguments, except the per-lane arguments
+  of `push_lane_masked` and `invoke_lane_masked`.
 - `pop(buf, &metadata, &bytes)` returns one whole message, or `false` without
   consuming anything if any part of it is not visible yet.
 
@@ -143,6 +147,90 @@ write:
 | `device_handle()` | queue must be drained; publishes the exact consumer position | any time; handles may be copied and used concurrently |
 
 Messages of one wavefront are popped in push order in both queues.
+
+### Lane-masked pushes
+
+The pushes above send one message per call, one payload word per lane.
+`push_lane_masked` sends one message per active lane, each with its own
+payload, length and metadata:
+
+```cpp
+template<typename T>
+bool push_lane_masked(const T& message, uint32_t bytes, uint32_t metadata, bool active);
+```
+
+- It is wavefront-collective on both queues, like every push: all 64 lanes
+  call it from converged code (debug builds trap otherwise). Each lane passes
+  its own arguments; a lane with `active` false pushes nothing, and the
+  values of its other arguments are ignored: its `message` contents, `bytes`
+  and `metadata` need not be meaningful. Its `message` must still be a valid
+  reference to a `T` object, as any C++ reference must, and may be read: for
+  lanes past the end of an array, clamp the index or pass a dummy object
+  instead of forming `data[i]` out of bounds.
+- An active lane sends the first `bytes` bytes of its own `message`.
+  `bytes > sizeof(T)` traps in every build.
+- The active lanes' messages take consecutive lines in lane order, so they
+  are popped in lane order, after the wavefront's earlier pushes. Each lane
+  writes every chunk of its own message.
+- A call is all-or-nothing and returns `bool`, like `push_lanes`:
+  - `SPSCD2HQueue`: one credit check for the whole call, which re-reads the
+    consumer index over PCIe only when the cached credit looks short. If the
+    active lanes' lines do not fit, nothing is written and the call returns
+    `false`; retry it with `while (!h.push_lane_masked(...)) {}`. The
+    producer index advances in registers, with no atomics. It mixes freely
+    with the collective pushes and persists across launches like them.
+  - `MPSCD2HQueue`: lane 0 claims the active lanes' lines with one fetch-add
+    per call and waits until the consumer has freed all of them, as the
+    collective pushes do; the call returns `true`. The handle's credit cache
+    is updated as in the collective pushes.
+- A call may take the whole ring: the consumer publishes its position on
+  every pop, so once it has popped every earlier message, a waiting call has
+  credit for up to `capacity` lines. A call whose active lanes need more
+  lines than the ring holds traps in every build, like a message longer than
+  the ring. The largest call, 64 messages of 512 B, takes 1024 lines.
+- Each lane holds its whole message in registers and writes it in
+  straight-line code, building each chunk just before its store: about
+  `sizeof(T) / 4 + 18` VGPRs. With the default launch bounds (1024 threads,
+  128 VGPRs), messages up to 384 B use no scratch; at 512 B the message
+  alone fills the budget and 60-90 B per lane spill.
+- An SPSC retry loop (`while (!h.push_lane_masked(...)) {}`) costs more: the
+  chunks do not change between retries, so the compiler builds all of them
+  before the loop and keeps them live, about 2.5 times the message. 128 B
+  takes about 90-100 VGPRs without scratch; from 192 B the push spills
+  (12-108 B per lane at 192 B, about 1 KB at 512 B). With
+  `__launch_bounds__(256)` (512 VGPRs) a 512-byte message takes 330-390
+  VGPRs and no scratch. MPSC calls need no retry loop.
+- Examples above: gfx942, ROCm 6.3 and 7.14, each lane's message loaded
+  from global memory; exact counts depend on the kernel.
+
+There is no per-lane push from divergent code (`if (c) push(a); else
+push(b);`) or from part of the wavefront; pass `active` instead. The SPSC
+producer index is a register that every lane must keep equal, and lanes on
+the two sides of a divergent branch are concurrent threads to the compiler:
+it may sink one side's plain store past the other side's load, so they cannot
+share producer state through memory either. On MPSC, a call from part of the
+wavefront could not update the credit cache the collective pushes share, so
+every such call re-read the consumer index over PCIe. A divergent per-lane
+push, if needed later, would be a separate API.
+
+```cpp
+__global__ void producer(SPSCD2HQueue::DeviceHandle h) {
+    Desc d = make_desc(threadIdx.x);
+    const bool has_work = d.bytes != 0;
+    while (!h.push_lane_masked(d, sizeof(Desc), kDesc, has_work)) {}  // whole wavefront
+    while (!h.push_reg(summary())) {}                                 // collective
+}
+```
+
+`invoke::DeviceContext<Q>::DeviceHandle::invoke_lane_masked(callback_id,
+active, args...)` is the invoke counterpart: each active lane serializes its
+own arguments (as `invoke` does) and pushes them as one message with its own
+`callback_id`, through `push_lane_masked`, whose result it returns, as
+`invoke` returns the push's. The host dispatches the messages like any other
+invoke. As with `push_lane_masked`, an inactive lane's `callback_id` and
+argument values are ignored, but its arguments must be valid references to
+readable objects; it may read them. For example,
+`invoke_lane_masked(id, i < n, data[i < n ? i : 0])` rather than `data[i]`.
 
 ### Cached host polling for device-to-host queues
 
@@ -264,12 +352,13 @@ See [`benchmarks/README.md`](../benchmarks/README.md) for command-line options.
 The most important tests for queue correctness are:
 
 - `test_queue_basic` — slot packing, config, and error handling.
-- `test_queue_chunk` — both device-to-host queues: every message size through every push path, wraparound in 1- to 4096-line rings, relaunch, batched publication, backpressure, late-chunk fault injection, and MPSC stress with up to 304 producer wavefronts on rings as small as one line.
+- `test_queue_chunk` — both device-to-host queues: every message size through every push path, wraparound in 1- to 4096-line rings, relaunch, consumer index publication on every pop, backpressure, late-chunk fault injection, and MPSC stress with up to 304 producer wavefronts on rings as small as one line.
 - `test_queue_concurrent` — SPSC GPU-to-CPU interaction.
 - `test_queue_host_poll_state` — cached host readiness polling.
 - `test_host_to_device_concurrent` — SPSC CPU-to-GPU interaction.
 - `test_queue_mpmc_h2d_concurrent` — MPMC CPU-to-GPU interaction.
-- `test_queue_push_isa` — SPSC and MPSC push kernels (including invoke through a `DeviceContext`) use no scratch, global stores and `readfirstlane` broadcasts; MPSC kernels claim with a global 64-bit fetch-add.
+- `test_queue_push_lane_masked` — `push_lane_masked` on both device-to-host queues: lane order, active masks, wraparound and back-pressure, an SPSC call that finds the ring short (returns `false`, writes nothing), mixed with collective pushes, many MPSC producer waves, and the traps.
+- `test_queue_push_isa` — SPSC and MPSC push kernels (including invoke through a `DeviceContext`) use no scratch, global stores and `readfirstlane` broadcasts; MPSC kernels claim with a global 64-bit fetch-add, and SPSC kernels use no atomics.
 - `test_queue_hardware` and `test_queue_wavefront_atomicity` — hardware assumptions used by the queue design.
 
 FlyDSL kernels can also invoke callbacks; see the [FlyDSL invoke guide](flydsl.md).
@@ -285,7 +374,7 @@ ctest --output-on-failure
 
 ### A push returns `false` or keeps waiting
 
-The queue is full. Increase capacity, reduce producer rate, or make sure the consumer is running and flushing progress when required. A device-to-host ring must hold the largest message (`message_lines(bytes)` lines); a message longer than the ring traps instead of waiting forever.
+The queue is full. Increase capacity, reduce producer rate, or make sure the consumer is running and flushing progress when required. A device-to-host ring must hold the largest message (`message_lines(bytes)` lines); a message longer than the ring traps instead of waiting forever, and so does a `push_lane_masked` call whose active lanes need more lines than the ring holds.
 
 ### Host-to-device producer stalls or sees a full queue after a kernel exits
 

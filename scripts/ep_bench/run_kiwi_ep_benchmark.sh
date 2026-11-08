@@ -31,9 +31,10 @@ Matrix environment knobs:
 
 Runtime knobs:
   NUM_PROXY_THREADS (default: 4), RCOMP_BACKEND (default: auto, using the
-  topology-aware threshold: hybrid at 8+ tokens for ws8 and at 4+ for the
-  ws16-derived fallback),
-  KIWI_REPO, MPIRUN, PYTHON, MASTER_ADDR, MASTER_PORT_BASE, ALLOW_RUN_AS_ROOT,
+  library's measured per-GPU/NIC launch policy in apps/ep/ep_tuning.hpp),
+  MPIRUN (default: "mpirun --bind-to none"; ranks stay unbound so KIWI can
+  bind proxy threads to GPU-local CPUs), KIWI_REPO, PYTHON, MASTER_ADDR,
+  MASTER_PORT_BASE, ALLOW_RUN_AS_ROOT,
   EXTRA_BENCH_ARGS, LD_LIBRARY_PATH, PYTHONPATH.
 USAGE
 }
@@ -55,9 +56,9 @@ repo=$(ep_bench_repo_root)
 BUILD_DIR=${BUILD_DIR:-$repo/build/ep-bench}
 out=$(ep_bench_output_dir kiwi-graph-$(_ep_bench_timestamp))
 PYTHON=${PYTHON:-python3}
-MPIRUN=${MPIRUN:-mpirun}
+MPIRUN=${MPIRUN:-$EP_BENCH_DEFAULT_MPIRUN}
 # Allow MPIRUN to include stable launcher flags such as
-# "mpirun --map-by ppr:4:socket --bind-to socket --rank-by slot".
+# "mpirun --map-by ppr:4:numa --bind-to numa".
 # This mirrors the other wrapper knobs that intentionally use simple
 # whitespace splitting for site-local launch configuration.
 # shellcheck disable=SC2206

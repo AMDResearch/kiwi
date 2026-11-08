@@ -9,7 +9,7 @@
 # for the previous push's host write), store the ring with
 # global_store_dwordx4 and no flat/buffer/scratch accesses, and broadcast
 # wave-uniform values with v_readfirstlane_b32, not ds_bpermute (__shfl).
-# The invoke kernel may load its handle from DeviceContext with one
+# The invoke kernels may load their handle from DeviceContext with one
 # flat_load. No kernel may compare two 64-bit VGPR pairs (v_cmp_*_u64 with two
 # v[a:b] operands): the queue indices are wave-uniform, so such a compare means
 # the handle sits in VGPRs and every push runs a divergent capacity check.
@@ -18,14 +18,16 @@
 # VALU compare: its credit check runs in 32 bits on the scalar unit (a 64-bit
 # unsigned compare has no SALU form and costs a VALU-to-vcc round trip).
 # MPSC kernels must also claim lines with a global (not flat) 64-bit
-# fetch-add and wait for credit with s_sleep.
+# fetch-add and wait for credit with s_sleep. SPSC kernels use no atomics.
 
 file(READ "${ASM}" isa)
 set(failures 0)
 foreach(kernel
         spsc_push_reg spsc_push_shared spsc_push_global spsc_push_lanes spsc_invoke_context
         spsc_invoke_loop
-        mpsc_push_reg mpsc_push_shared mpsc_push_global mpsc_push_lanes mpsc_invoke_context)
+        spsc_push_lane_masked spsc_invoke_lane_masked
+        mpsc_push_reg mpsc_push_shared mpsc_push_global mpsc_push_lanes mpsc_invoke_context
+        mpsc_push_lane_masked mpsc_invoke_lane_masked)
     string(FIND "${isa}" "\n${kernel}:" begin)
     string(FIND "${isa}" ".amdhsa_kernel ${kernel}\n" desc)
     if(begin EQUAL -1 OR desc EQUAL -1)
@@ -43,7 +45,10 @@ foreach(kernel
         list(APPEND want global_atomic_add_x2 s_sleep)
     endif()
     set(avoid flat_store flat_atomic scratch_ buffer_store buffer_load ds_bpermute)
-    if(NOT kernel MATCHES "_invoke_(context|loop)$")
+    if(kernel MATCHES "^spsc_")
+        list(APPEND avoid global_atomic)
+    endif()
+    if(NOT kernel MATCHES "_invoke_(context|loop|lane_masked)$")
         list(APPEND avoid flat_load)
     endif()
     set(bad "")

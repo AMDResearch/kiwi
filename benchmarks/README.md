@@ -59,6 +59,10 @@ Common options:
 - `-s,--stats` — print latency percentiles.
 - `--bytes INT` — message bytes pushed with `push_reg`, default `56` (one of
   8, 24, 32, 48, 56, 64, 112, 168, 240, 448, 512).
+- `--push collective|lane-masked|mixed` — how the producer wave pushes,
+  default `collective` (see [Push patterns](#push-patterns)). Each iteration
+  is one step; the host acks once it has popped all of the step's messages.
+- `--lanes INT` — active lanes per lane-masked push call, default `64`.
 - `-v,--verbose` — verbose output.
 
 Every push and invoke benchmark kernel is checked with `require_no_scratch()`
@@ -84,7 +88,7 @@ Common options:
 - `-q,--queues INT` — MPSC queues, default one per consumer thread.
 - `--poll-mode direct|host-poll-state` — consumer polling, default
   `host-poll-state`.
-- `--bytes` — as for `bench_queue_latency`.
+- `--bytes`, `--push`, `--lanes` — as for `bench_queue_latency`.
 - `-v,--verbose` — verbose output.
 
 ### `bench_queue_overhead`
@@ -102,8 +106,21 @@ Common options:
 - `-m,--messages INT` — number of messages, default `100000`.
 - `-w,--warmup INT` — warmup iterations, default auto.
 - `--mpsc` — use `MPSCD2HQueue`.
-- `--bytes` — as for `bench_queue_latency`.
+- `--bytes`, `--push`, `--lanes` — as for `bench_queue_latency`. One timing
+  is one step; a `mixed` step is also reported in its two halves.
 - `-v,--verbose` — verbose output.
+
+### Push patterns
+
+`bench_queue_latency`, `bench_queue_throughput` and `bench_queue_overhead`
+take `--push` and `--lanes`. One step of a pattern is one push call:
+
+- `collective` — `push_reg` by the whole wave, one message.
+- `lane-masked` — `push_lane_masked` by the whole wave with lanes
+  `[0, --lanes)` active, one message per active lane; an SPSC call that
+  finds the ring short is retried. The call must fit the ring
+  (`--capacity` lines), or the benchmark exits with an error.
+- `mixed` — `collective`, then `lane-masked`.
 
 ### `bench_host_to_device_latency`
 
@@ -208,6 +225,10 @@ Common options:
 - `-c,--capacity INT` — queue capacity in 64-byte lines, default `1024`.
 - `-m,--messages INT` — number of invokes, default `100000`.
 - `-w,--warmup INT` — warmup iterations, default auto.
+- `--lanes INT` — time `invoke_lane_masked` with lanes `[0, INT)` active
+  (INT callbacks per call) instead of `invoke`; default `0` (`invoke`).
+  The no-backpressure test needs a capacity above `INT` times the measured
+  calls.
 - `-v,--verbose` — verbose output.
 
 ## Cross-frontend harnesses

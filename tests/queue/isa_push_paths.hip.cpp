@@ -9,7 +9,9 @@
  * device-to-host queue, one extern "C" kernel per push path, plus an invoke
  * kernel that loads its handle from a device-resident DeviceContext. The SPSC
  * invoke loop is the benchmarks' producer loop, where the credit check must
- * stay on the scalar unit.
+ * stay on the scalar unit. The lane-masked kernels push one message per
+ * active lane with push_lane_masked() (SPSC between collective pushes) and
+ * invoke_lane_masked().
  */
 
 #include <kiwi/invoke/invoke.hpp>
@@ -61,6 +63,25 @@ __device__ void invoke_from_context(kiwi::invoke::DeviceContext<Queue>* ctx, uin
     while (!h.invoke_shared(2, row, bytes)) {}
 }
 
+/// A 168-byte message per lane; lane l is active if bit l of x is set.
+template <typename Handle>
+__device__ void push_lane_masked(Handle& h, uint64_t x) {
+    Msg<168> m;
+#pragma unroll
+    for (size_t k = 0; k < sizeof(m.b); ++k) m.b[k] = static_cast<uint8_t>(x - k + __lane_id());
+    while (!h.push_lane_masked(m, static_cast<uint32_t>(x & 127), 8, (x >> __lane_id()) & 1)) {}
+}
+
+/// Per-lane callbacks: lane l is active if bit l of x is set.
+template <typename Queue>
+__device__ void invoke_lane_masked(kiwi::invoke::DeviceContext<Queue>* ctx, uint64_t x) {
+    auto h = ctx->get_device_handle(0);
+    const bool active = (x >> __lane_id()) & 1;
+    while (!h.invoke_lane_masked(static_cast<uint8_t>(__lane_id() & 3), active)) {}
+    while (!h.invoke_lane_masked(1, active, static_cast<uint8_t>(x), static_cast<uint32_t>(x),
+                                 x + __lane_id())) {}  // 13 B
+}
+
 }  // namespace
 
 extern "C" {
@@ -94,6 +115,23 @@ __global__ void mpsc_push_global(Mpsc h, const uint64_t* p, size_t n) {
 __global__ void mpsc_push_lanes(Mpsc h, uint64_t x, uint32_t bytes) {
     while (!h.push_lanes(x + __lane_id(), bytes, 7)) {}
 }
+__global__ void mpsc_push_lane_masked(Mpsc h, uint64_t x) { push_lane_masked(h, x); }
+
+__global__ void spsc_push_lane_masked(Spsc h, uint64_t x) {
+    push_reg_one<56>(h, x);
+    push_lane_masked(h, x);
+    push_reg_one<168>(h, x);
+}
+
+__global__ void spsc_invoke_lane_masked(kiwi::invoke::DeviceContext<SPSCD2HQueue>* ctx,
+                                        uint64_t x) {
+    invoke_lane_masked(ctx, x);
+}
+__global__ void mpsc_invoke_lane_masked(kiwi::invoke::DeviceContext<MPSCD2HQueue>* ctx,
+                                        uint64_t x) {
+    invoke_lane_masked(ctx, x);
+}
+
 __global__ void mpsc_invoke_context(kiwi::invoke::DeviceContext<MPSCD2HQueue>* ctx, uint64_t x,
                                     size_t bytes) {
     invoke_from_context(ctx, x, bytes);

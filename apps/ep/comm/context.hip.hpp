@@ -90,7 +90,7 @@ public:
 private:
     void wait_drained();
     void proxy_thread_func(int thread_id, int num_proxy_threads,
-                           int selected_cpu);
+                           std::vector<int> cpus);
 
     internal::ep_runtime_ref_t runtime_;
     int num_queues_ = 0;

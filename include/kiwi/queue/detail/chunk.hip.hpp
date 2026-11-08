@@ -7,8 +7,10 @@
  *
  * Ring layout. A device-to-host ring is `capacity` 64-byte lines of four
  * 16-byte chunks. Lane c of the pushing wavefront writes chunk c of a message
- * with one 16-byte store (global_store_dwordx4). A chunk is two 8-byte
- * halves, each 4 B of data and a 4 B signal (the LL8 format):
+ * with one 16-byte store (global_store_dwordx4); in push_lane_masked() each
+ * active lane stores every chunk of its own message instead.
+ * A chunk is two 8-byte halves, each 4 B of data and a 4 B signal (the LL8
+ * format):
  *
  *   chunk = 16 B  +---------+---------+---------+---------+
  *                 | data lo |  sig 0  | data hi |  sig 1  |
@@ -18,7 +20,8 @@
  *   data:  payload bytes [8c, 8c + 4) and [8c + 4, 8c + 8) of the message.
  *          Chunks wholly past the payload carry zero; the bytes of the last
  *          word past the payload are unspecified (push_shared/push_global/
- *          push_lanes pass them through) and never returned by pop().
+ *          push_lanes/push_lane_masked pass them through) and never returned
+ *          by pop().
  *   sig 0: bits  0-7   epoch = (line index >> log2(capacity)) & 0xff, in every
  *                      signal, including the padding chunks of the last line
  *          bits  8-15  metadata bits 0-7   (chunk 0 only)
@@ -55,8 +58,8 @@
 #include <cstdint>
 #include <type_traits>
 
-// Every device-to-host push is wavefront-collective over 64 lanes (one chunk
-// per lane). GFX9 (CDNA: gfx90a, gfx942, gfx950) runs only wave64.
+// Every device-to-host push is wavefront-collective over 64 lanes. GFX9 (CDNA:
+// gfx90a, gfx942, gfx950) runs only wave64.
 #if defined(__HIP_DEVICE_COMPILE__) && !defined(__GFX9__)
 #error "KIWI device-to-host queues require a wave64 GFX9 target"
 #endif
@@ -213,6 +216,78 @@ __device__ __forceinline__ void write_message(global_ptr<Chunk> ring, uint32_t l
         const uint64_t mask = (uint64_t{1} << log2_capacity) - 1;
         ring[(line & mask) * kChunksPerLine + lane % kChunksPerLine] = make_chunk(data, signal);
     }
+}
+
+/// The calling lane alone stores every chunk of a `bytes`-byte message of
+/// `lines` lines starting at absolute line `base`, payload from the first
+/// `bytes` bytes of `message`: the per-lane counterpart of write_message(),
+/// with the same chunks and signals. Offsets into `message` are compile-time
+/// constants, so the message is never indexed dynamically. A lane with
+/// `lines` 0 stores nothing.
+template<typename T>
+__device__ __forceinline__ void write_lane_message(global_ptr<Chunk> ring, uint32_t log2_capacity,
+                                                   uint64_t base, const T& message, uint32_t bytes,
+                                                   uint32_t metadata, uint64_t lines) {
+    const unsigned char* src = reinterpret_cast<const unsigned char*>(&message);
+    const uint64_t mask = (uint64_t{1} << log2_capacity) - 1;
+#pragma unroll
+    for (size_t k = 0; k < message_lines(sizeof(T)) * kChunksPerLine; ++k) {
+        if (k < lines * kChunksPerLine) {
+            uint64_t word = 0;
+            if (k < sizeof(T) / kChunkPayloadBytes) {
+                __builtin_memcpy(&word, src + k * kChunkPayloadBytes, kChunkPayloadBytes);
+            } else if (k * kChunkPayloadBytes < sizeof(T)) {
+                __builtin_memcpy(&word, src + k * kChunkPayloadBytes,
+                                 sizeof(T) % kChunkPayloadBytes);
+            }
+            const uint64_t line = base + k / kChunksPerLine;
+            const uint64_t data = k * kChunkPayloadBytes < bytes ? word : 0;
+            const uint64_t signal = make_signal(line_epoch(line, log2_capacity),
+                                                k == 0 ? bytes : 0, k == 0 ? metadata : 0);
+            ring[(line & mask) * kChunksPerLine + k % kChunksPerLine] = make_chunk(data, signal);
+        }
+    }
+}
+
+/// Lines and claim offsets of one push_lane_masked() call.
+struct LaneClaim {
+    uint64_t lines;   ///< this lane's message lines (0 if inactive)
+    uint64_t prefix;  ///< lines of the active lanes below this one
+    uint64_t total;   ///< lines of all active lanes (wave-uniform, at most 64 * kMaxMessageLines)
+};
+
+/**
+ * @brief Lines each active lane of a push_lane_masked() call claims, in lane
+ *        order
+ *
+ * The whole wavefront calls it. An active lane sends the first `bytes` bytes
+ * of its message and traps, in every build, if `bytes` > sizeof(T). An
+ * inactive lane claims nothing, and its `bytes` is ignored. The call traps,
+ * in every build, if the active lanes need more lines than the ring holds.
+ * The prefix sum takes one ballot per bit of the line count.
+ */
+template<typename T>
+__device__ __forceinline__ LaneClaim lane_masked_claim(uint32_t bytes, bool active,
+                                                       uint32_t log2_capacity) {
+    static_assert(std::is_trivially_copyable_v<T>, "push_lane_masked() copies the message bytes");
+    static_assert(sizeof(T) <= kMaxMessageBytes, "message exceeds kMaxMessageBytes");
+    static_assert(kMaxMessageLines < 32, "the claim scans five bits of a line count");
+    if (active && bytes > sizeof(T)) {
+        __builtin_trap();
+    }
+    const uint64_t lines = active ? message_lines(bytes) : 0;
+    const uint64_t lower = (uint64_t{1} << __lane_id()) - 1;
+    LaneClaim c{lines, 0, 0};
+#pragma unroll
+    for (int b = 0; b < 5; ++b) {
+        const uint64_t set = __builtin_amdgcn_ballot_w64(((lines >> b) & 1) != 0);
+        c.prefix += static_cast<uint64_t>(__builtin_popcountll(set & lower)) << b;
+        c.total += static_cast<uint64_t>(__builtin_popcountll(set)) << b;
+    }
+    if (c.total > (uint64_t{1} << log2_capacity)) {
+        __builtin_trap();  // could never fit; trap before claiming lines
+    }
+    return c;
 }
 
 /// Debug builds trap unless all 64 lanes call the push (the wavefront

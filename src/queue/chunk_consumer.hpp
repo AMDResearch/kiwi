@@ -35,29 +35,6 @@ inline Chunk load_chunk(const Chunk* p) {
     return c;
 }
 
-/**
- * @brief Lines between publications of the consumer index
- *
- * The consumer publishes when its position crosses a multiple of the
- * interval K, so the published index is at least position - K + 1. The
- * producer of the oldest unconsumed message (at most kMaxMessageLines lines)
- * then has credit while K + kMaxMessageLines - 1 <= capacity. K is the
- * largest power of two up to 64 that satisfies this, or 1 for small rings.
- */
-inline uint64_t publish_interval(size_t capacity) {
-    uint64_t k = 64;
-    while (k > 1 && k + kMaxMessageLines - 1 > capacity) {
-        k >>= 1;
-    }
-    return k;
-}
-
-/// True if moving the consumer from line `from` to line `to` crosses a
-/// multiple of `interval` (a power of two).
-inline bool crosses_publish_point(uint64_t from, uint64_t to, uint64_t interval) {
-    return ((from ^ to) & ~(interval - 1)) != 0;
-}
-
 /// Allocates a ring of `capacity` lines in extended-scope host memory; every
 /// chunk starts as lap -1 (epoch 0xff), which no consumer position expects.
 inline Chunk* allocate_ring(size_t capacity) {
@@ -211,25 +188,23 @@ __attribute__((always_inline)) inline bool read_message(
  * @brief The single-consumer pop of the device-to-host queues
  *
  * Copies the message at the private position `head` if it is whole, moves
- * `head` past it, and publishes the new position to `consumer_index` when it
- * crosses a multiple of `interval`. Returns false and changes nothing if the
- * message is not fully visible. Forced inline: pop() is the proxy thread's
- * hot path, and a call would also keep `head` in memory.
+ * `head` past it, and publishes the new position to `consumer_index`, on
+ * every pop: the published index is then always the consumer position, so a
+ * producer waiting for credit gets it as soon as the lines are popped.
+ * Returns false and changes nothing if the message is not fully visible.
+ * Forced inline: pop() is the proxy thread's hot path, and a call would also
+ * keep `head` in memory.
  */
 __attribute__((always_inline)) inline bool pop_message(
-    const Chunk* ring, uint64_t mask, uint32_t log2_capacity, uint64_t interval, uint64_t& head,
+    const Chunk* ring, uint64_t mask, uint32_t log2_capacity, uint64_t& head,
     uint64_t* consumer_index, void* buf, uint32_t* metadata, size_t* bytes) {
-    const uint64_t from = head;
     MessageInfo info;
-    if (!read_message(ring, mask, log2_capacity, from, buf, info)) {
+    if (!read_message(ring, mask, log2_capacity, head, buf, info)) {
         return false;
     }
-    const uint64_t next = from + message_lines(info.bytes);
-    head = next;
+    head += message_lines(info.bytes);
     // x86 does not reorder this store before the ring loads above.
-    if (crosses_publish_point(from, next, interval)) {
-        __atomic_store_n(consumer_index, next, __ATOMIC_RELEASE);
-    }
+    __atomic_store_n(consumer_index, head, __ATOMIC_RELEASE);
     if (metadata != nullptr) {
         *metadata = info.metadata;
     }

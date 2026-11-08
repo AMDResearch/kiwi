@@ -62,6 +62,36 @@ public:
                                       size_t arg_bytes) {
             return queue.push_shared(lds_args, arg_bytes, callback_id);
         }
+
+        // Invoke a callback per lane (wave-level: full wavefront, converged).
+        // Each lane passes its own callback_id, active flag and arguments;
+        // every active lane sends one message, the same as invoke() with its
+        // arguments would, through push_lane_masked(), and an inactive lane
+        // sends nothing. The active lanes' callbacks run in lane order. An
+        // inactive lane's callback_id and argument values are ignored, but
+        // its arguments must be valid references to readable objects, as
+        // any reference must (it may read them): for lanes past the end of
+        // an array, clamp the index or pass a dummy object.
+        // Returns push_lane_masked()'s result, as invoke() does: false (on
+        // SPSC) if the ring lacks credit for every active lane's message, and
+        // then nothing is sent. A call needing more lines than the ring
+        // holds traps. `active` comes before the arguments because a
+        // parameter after the pack could not be deduced.
+        template<typename... Args>
+        __device__ bool invoke_lane_masked(uint8_t callback_id, bool active, const Args&... args) {
+            constexpr size_t arg_bytes = internal::ArgumentSerializer<Args...>::total_bytes;
+            static_assert(arg_bytes <= kiwi::queue::kMaxMessageBytes,
+                          "invoke arguments exceed kiwi::queue::kMaxMessageBytes");
+            if constexpr (arg_bytes == 0) {
+                return queue.push_lane_masked(uint64_t{0}, 0, callback_id, active);  // header only
+            } else {
+                struct Payload {
+                    uint8_t bytes[arg_bytes];
+                } payload;
+                internal::ArgumentSerializer<Args...>::serialize(payload.bytes, args...);
+                return queue.push_lane_masked(payload, arg_bytes, callback_id, active);
+            }
+        }
     };
 
     // Returns a by-value copy of the DeviceHandle for the given endpoint.

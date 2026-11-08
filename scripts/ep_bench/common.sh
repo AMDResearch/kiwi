@@ -84,6 +84,12 @@ ep_bench_make_pythonpath() {
   fi
 }
 
+# Default launcher for the EP wrappers. Leave ranks unbound: KIWI binds each
+# rank's proxy threads to its GPU's local CPUs within the rank's affinity mask,
+# and Open MPI's default socket round-robin can bind a rank away from its GPU.
+# Callers may override MPIRUN with site-specific mapping/binding flags.
+EP_BENCH_DEFAULT_MPIRUN="mpirun --bind-to none"
+
 ep_bench_mpirun_root_args() {
   if [[ "${ALLOW_RUN_AS_ROOT:-0}" == "1" ]]; then
     printf '%s\0' --allow-run-as-root

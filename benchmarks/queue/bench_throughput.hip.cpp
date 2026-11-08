@@ -8,7 +8,8 @@
  * SPSC (default): one queue per GPU producer wavefront. MPSC (--mpsc): wave w
  * pushes to queue w % Q (--queues, default one per consumer thread). Each
  * consumer thread polls its share of the queues. --bytes selects the message
- * size (8 to 512 bytes).
+ * size (8 to 512 bytes); --push and --lanes how each wave pushes (collective
+ * or lane-masked; see queue_bench.hip.hpp).
  */
 
 #include <kiwi/queue/queue.hpp>
@@ -52,6 +53,8 @@ struct ExperimentParams {
     bool mpsc = false;
     std::string poll_mode = "host-poll-state";
     int message_bytes = 56;
+    queue_bench::Push push = queue_bench::Push::Collective;
+    int lanes = 64;
     bool verbose = false;
 };
 
@@ -59,22 +62,34 @@ struct ExperimentParams {
 // Producer kernel and consumer
 // ---------------------------------------------------------------------------
 
-// Wave w pushes num_msgs_per_wave messages to queue w % num_queues.
-template<typename Queue, size_t Bytes>
+// Wave w pushes num_steps_per_wave steps of pattern P to queue w % num_queues.
+template<typename Queue, queue_bench::Push P, size_t Bytes>
 __global__ void push_kernel(ProducerContext<Queue>* context,
-                            int num_msgs_per_wave,
+                            int num_steps_per_wave,
                             int num_waves,
                             int waves_per_block,
-                            int num_queues) {
+                            int num_queues,
+                            int lanes) {
+    using queue_bench::Push;
     int wave_in_block = threadIdx.x / 64;
     int wave = blockIdx.x * waves_per_block + wave_in_block;
     if (wave >= num_waves) return;
 
     auto handle = context->get_device_handle(wave % num_queues);
-    queue_bench::Message<Bytes> payload{};
-    for (int i = 0; i < num_msgs_per_wave; ++i) {
-        payload.value = static_cast<uint32_t>(wave * num_msgs_per_wave + i);
-        while (!handle.push_reg(payload)) {}
+    if constexpr (P == Push::Collective) {
+        // The collective loop as before lane-masked pushes, so its code (and
+        // results) stay comparable.
+        queue_bench::Message<Bytes> payload{};
+        for (int i = 0; i < num_steps_per_wave; ++i) {
+            payload.value = static_cast<uint32_t>(wave * num_steps_per_wave + i);
+            while (!handle.push_reg(payload)) {}
+        }
+        return;
+    }
+    const int msgs = queue_bench::step_messages(P, lanes);
+    for (int i = 0; i < num_steps_per_wave; ++i) {
+        const auto seq = static_cast<uint32_t>((wave * num_steps_per_wave + i) * msgs);
+        queue_bench::push_step<P, Bytes>(handle, seq, lanes);
     }
 }
 
@@ -169,15 +184,17 @@ static void print_results(const ExperimentParams& params, int total_messages,
 // Benchmark
 // ---------------------------------------------------------------------------
 
-template<typename Queue, size_t Bytes>
+template<typename Queue, queue_bench::Push P, size_t Bytes>
 static void benchmark(const ExperimentParams& params,
                       const std::vector<int>& worker_cpus,
                       int coordinator_cpu) {
-    require_no_scratch(push_kernel<Queue, Bytes>, "push_kernel");
+    require_no_scratch(push_kernel<Queue, P, Bytes>, "push_kernel");
     using Handle = typename Queue::DeviceHandle;
     int num_waves = params.num_gpu_blocks;
     int num_queues = params.num_queues;
-    int msgs_per_wave = params.num_messages / num_waves;
+    int step_msgs = queue_bench::step_messages(P, params.lanes);
+    int steps_per_wave = params.num_messages / num_waves / step_msgs;
+    int msgs_per_wave = steps_per_wave * step_msgs;
     int total_messages = msgs_per_wave * num_waves;
     int waves_per_block = std::max(1, (num_waves + 255) / 256);
     int launch_blocks = (num_waves + waves_per_block - 1) / waves_per_block;
@@ -224,8 +241,8 @@ static void benchmark(const ExperimentParams& params,
     }
 
     auto t_start = std::chrono::high_resolution_clock::now();
-    push_kernel<Queue, Bytes><<<launch_blocks, 64 * waves_per_block>>>(
-        d_context, msgs_per_wave, num_waves, waves_per_block, num_queues);
+    push_kernel<Queue, P, Bytes><<<launch_blocks, 64 * waves_per_block>>>(
+        d_context, steps_per_wave, num_waves, waves_per_block, num_queues, params.lanes);
     KIWI_HIP_CHECK(hipDeviceSynchronize());
     for (auto& c : consumers) c.join();
     auto t_end = std::chrono::high_resolution_clock::now();
@@ -266,9 +283,17 @@ int main(int argc, char** argv) {
         ->check(CLI::IsMember({"direct", "host-poll-state"}));
     app.add_option("--bytes", params.message_bytes, "Message bytes")
         ->default_val(56)->check(CLI::IsMember(queue_bench::sizes()));
+    app.add_option("--push", params.push, "collective, lane-masked or mixed")
+        ->transform(CLI::CheckedTransformer(queue_bench::push_names()));
+    app.add_option("--lanes", params.lanes, "Active lanes per lane-masked push call")
+        ->default_val(64)->check(CLI::Range(1, 64));
     app.add_flag("-v,--verbose", params.verbose, "Per-thread breakdown");
 
     CLI11_PARSE(app, argc, argv);
+    if (!queue_bench::lane_masked_call_fits(params.push, params.lanes, params.message_bytes,
+                                            params.queue_capacity)) {
+        return 1;
+    }
 
     if (params.num_gpu_blocks > 4096) {
         std::cerr << "GPU producer wavefronts must not exceed 4096\n";
@@ -305,14 +330,20 @@ int main(int argc, char** argv) {
     std::cout << "Waves per block:    " << waves_per_block << "\n";
     std::cout << "CPU consumers:     " << params.num_cpu_threads << " threads\n";
     std::cout << "Polling:           " << params.poll_mode << "\n";
+    std::cout << "Push:              " << queue_bench::push_name(params.push);
+    if (params.push != queue_bench::Push::Collective) std::cout << ", " << params.lanes << " lanes";
+    std::cout << "\n";
     print_worker_cpu_plan(worker_cpus);
 
     queue_bench::dispatch(params.message_bytes, [&](auto bytes) {
-        constexpr size_t B = decltype(bytes)::value;
-        if (params.mpsc)
-            benchmark<MPSCD2HQueue, B>(params, worker_cpus, coordinator_cpu);
-        else
-            benchmark<SPSCD2HQueue, B>(params, worker_cpus, coordinator_cpu);
+        queue_bench::dispatch_push(params.push, [&](auto push) {
+            constexpr size_t B = decltype(bytes)::value;
+            constexpr queue_bench::Push P = decltype(push)::value;
+            if (params.mpsc)
+                benchmark<MPSCD2HQueue, P, B>(params, worker_cpus, coordinator_cpu);
+            else
+                benchmark<SPSCD2HQueue, P, B>(params, worker_cpus, coordinator_cpu);
+        });
     });
 
     return 0;
