@@ -13,7 +13,7 @@ if(NOT DEFINED HIP_ARCHITECTURES)
         set(HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
     else()
         execute_process(
-            COMMAND bash -c "rocminfo | grep -o 'gfx[0-9]*' | head -1"
+            COMMAND bash -c "rocminfo | grep -o 'gfx[0-9a-f]*' | head -1"
             OUTPUT_VARIABLE ROCM_ARCH
             OUTPUT_STRIP_TRAILING_WHITESPACE
         )

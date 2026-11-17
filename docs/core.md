@@ -24,11 +24,11 @@ Device-to-host queues carry messages of up to **512 bytes** in **16-byte chunks*
   sequence numbers.
 - Epoch-based readiness, so slots and lines do not need separate clearing.
 - Cached producer/consumer progress to reduce PCIe traffic on hot paths.
-- Benchmark and hardware-assumption test suites for MI300X/ROCm systems.
+- Benchmark and hardware-assumption test suites for AMD Instinct/ROCm systems.
 
 ## Requirements
 
-- AMD GPU with ROCm/HIP support. The default CMake fallback architecture is `gfx942` for MI300X.
+- AMD Instinct GPU with ROCm/HIP support; tested on MI250X (`gfx90a`), MI300X and MI308X (`gfx942`), and MI355X (`gfx950`). CMake detects the architecture with `rocminfo` and falls back to `gfx942` when no GPU is visible.
 - ROCm/HIP installation, usually under `/opt/rocm` or pointed to by `ROCM_PATH`/`HIP_PATH`.
 - ROCr with an allocatable extended-scope fine-grained host memory pool.
 - CMake 3.21 or newer.

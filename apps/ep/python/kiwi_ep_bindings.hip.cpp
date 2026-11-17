@@ -164,6 +164,24 @@ public:
                 "KiwiEpOp combine_quant_format fp8/fp4 requires "
                 "a one-byte combine_dtype");
         }
+        // The combine reducer decodes by element size and quant format:
+        // 4 B as float32, 2 B as bfloat16, and FP8 as e4m3 FNUZ (raw uint8
+        // storage of FNUZ bytes is accepted).
+        const bool combine_dtype_supported =
+            combine_quant_format_value == kiwi::ep::quant_format_t::FP4
+            || (combine_quant_format_value == kiwi::ep::quant_format_t::FP8
+                && (combine_dtype == torch::kFloat8_e4m3fnuz
+                    || combine_dtype == torch::kByte))
+            || (combine_quant_format_value == kiwi::ep::quant_format_t::NONE
+                && (combine_dtype == torch::kFloat
+                    || combine_dtype == torch::kBFloat16));
+        if (!combine_dtype_supported) {
+            throw std::runtime_error(
+                "KiwiEpOp combine supports float32, bfloat16, "
+                "float8_e4m3fnuz or uint8 with fp8, or fp4; got "
+                + std::string(c10::toString(combine_dtype)) + " with "
+                + combine_quant_format);
+        }
         cfg_.world_size = world_size;
         cfg_.num_experts = num_experts_per_rank * world_size;
         // MORI's FP4 public config uses the logical hidden size while the
@@ -251,6 +269,14 @@ public:
 
     ~KiwiEpOp() {
         if (ctx_) {
+            // dispatch/combine are enqueued on caller streams; drain this
+            // op's device before the proxies stop, or its last posts are
+            // never sent.
+            int prev_device = device_id_;
+            (void)hipGetDevice(&prev_device);
+            (void)hipSetDevice(device_id_);
+            (void)hipDeviceSynchronize();
+            (void)hipSetDevice(prev_device);
             ctx_->join_proxy_threads();
         }
         if (stream_) {

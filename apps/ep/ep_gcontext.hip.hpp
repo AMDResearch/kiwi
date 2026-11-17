@@ -32,18 +32,13 @@ struct ep_gcontext_t {
     int world_size;
     int rank_me;
     int num_experts_per_rank;
-    int model_hidden_dim;        // one shared logical model feature dimension
     int dispatch_hidden_elems;
     int combine_hidden_elems;
     int topk;
-    int max_slots;              // total MORI-visible receive rows
     // MORI-compatible source-token capacity; per-source receive slot count.
     int max_num_inp_token_per_rank;
     int dispatch_scale_dim;
     int dispatch_scale_type_size;
-    int combine_scale_dim;
-    int combine_scale_type_size;
-    quant_format_t dispatch_quant_format;
     quant_format_t combine_quant_format;
     // Wire-format + heap-region layouts.  These mirror DeepEP's separation of
     // per-token slot field layout from buffer/heap placement: dispatch and

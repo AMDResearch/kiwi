@@ -8,7 +8,7 @@ KIWI is a HIP/C++ prototype for GPU-initiated communication on top of [LCI](http
 
 The repository also contains an experimental **EP layer** (`kiwi_ep`) for MoE-style dispatch/combine work. Treat `kiwi_ep` as work in progress; its APIs and performance characteristics are still evolving.
 
-The code currently targets AMD ROCm/HIP systems and defaults to the MI300X `gfx942` architecture when CMake cannot auto-detect a GPU architecture.
+The code targets AMD Instinct GPUs with ROCm/HIP; see [supported hardware](../README.md#supported-hardware). CMake detects the GPU architecture and falls back to `gfx942` when it cannot.
 
 ## Repository Layout
 

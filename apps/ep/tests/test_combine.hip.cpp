@@ -110,9 +110,12 @@ static void fill_routing(int32_t* h_indices, float* h_weights,
                 }
                 break;
             }
-            h_indices[t * topk + k] =
-                expert_id_for_rank(dest_rank, t + k + round,
-                                   num_experts_per_rank);
+            // With 8+ tokens the last one is fully unrouted (all -1), which
+            // combine must still write as a zero row.
+            h_indices[t * topk + k] = (num_tokens >= 8 && t == num_tokens - 1)
+                ? -1
+                : expert_id_for_rank(dest_rank, t + k + round,
+                                     num_experts_per_rank);
             h_weights[t * topk + k] =
                 0.01f * static_cast<float>(t + 1)
               + static_cast<float>(k + 1) / static_cast<float>(topk + 1)
@@ -141,6 +144,9 @@ static void compute_expected(float* expected, const float* h_tokens,
 
         for (int k = 0; k < topk; k++) {
             int expert_id = h_indices[t * topk + k];
+            if (expert_id < 0) {
+                continue;
+            }
             int dest_rank = expert_id / num_experts_per_rank;
 
             int unique_idx = -1;
@@ -179,6 +185,9 @@ static void compute_expected_output_weights(float* expected,
 
         for (int k = 0; k < topk; k++) {
             int expert_id = h_indices[t * topk + k];
+            if (expert_id < 0) {
+                continue;
+            }
             int dest_rank = expert_id / num_experts_per_rank;
 
             bool found = false;
@@ -246,7 +255,18 @@ static int validate_token_route_metadata(
                 }
             }
 
-            if (unique_idx == -1) {
+            if (expert_id < 0) {
+                if (producer_rank != world_size || dispatch_recv_slot != 0) {
+                    if (errors < kMaxVerboseErrors) {
+                        fprintf(stderr,
+                                "[Rank %d] %s unrouted sentinel mismatch at "
+                                "token %d k=%d: got [%d, %d]\n",
+                                rank, impl_name, t, k, producer_rank,
+                                dispatch_recv_slot);
+                    }
+                    errors++;
+                }
+            } else if (unique_idx == -1) {
                 if (producer_rank != dest_rank) {
                     if (errors < kMaxVerboseErrors) {
                         fprintf(stderr,
@@ -502,7 +522,9 @@ static bool test_combine(const kiwi::ep::config_t& cfg,
         HIP_CHECK(hipMemcpyAsync(d_weights, h_weights.data(),
                                  total_routing * sizeof(float),
                                  hipMemcpyHostToDevice, stream));
-        HIP_CHECK(hipMemsetAsync(d_output, 0,
+        // Non-zero fill: combine must write every row, including zero rows
+        // for fully unrouted tokens.
+        HIP_CHECK(hipMemsetAsync(d_output, 0x7f,
                                  total_elems * sizeof(float), stream));
         HIP_CHECK(hipMemsetAsync(d_output_weights, 0,
                                  total_routing * sizeof(float), stream));

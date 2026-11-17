@@ -127,6 +127,13 @@ ep_context_t::ep_context_t(const config_t& cfg)
                       get_requested_or_auto_hca_name_for_current_gpu()
                 : cfg_.device_name);
     }
+    if (cfg_.max_auto_num_blocks == 0) {
+        int hip_device = 0;
+        HIP_CHECK(hipGetDevice(&hip_device));
+        HIP_CHECK(hipDeviceGetAttribute(&cfg_.max_auto_num_blocks,
+                                        hipDeviceAttributeMultiprocessorCount,
+                                        hip_device));
+    }
     const int provisioned_num_blocks = cfg_.provisioned_num_blocks();
     if (provisioned_num_blocks <= 0) {
         throw std::invalid_argument(
@@ -549,17 +556,12 @@ ep_gcontext_t ep_context_t::get_device_context() {
     gctx.world_size = cfg_.world_size;
     gctx.rank_me = lci::get_rank_me();
     gctx.num_experts_per_rank = cfg_.num_experts_per_rank();
-    gctx.model_hidden_dim = cfg_.model_hidden_dim;
     gctx.dispatch_hidden_elems = cfg_.dispatch_hidden_elems_effective();
     gctx.combine_hidden_elems = cfg_.combine_hidden_elems_effective();
     gctx.topk = cfg_.topk;
-    gctx.max_slots = cfg_.max_slots();
     gctx.max_num_inp_token_per_rank = cfg_.max_num_inp_token_per_rank;
     gctx.dispatch_scale_dim = cfg_.dispatch_scale_dim;
     gctx.dispatch_scale_type_size = cfg_.dispatch_scale_type_size;
-    gctx.combine_scale_dim = cfg_.combine_scale_dim;
-    gctx.combine_scale_type_size = cfg_.combine_scale_type_size;
-    gctx.dispatch_quant_format = cfg_.dispatch_quant_format;
     gctx.combine_quant_format = cfg_.combine_quant_format;
     gctx.dispatch_layout = cfg_.dispatch_buffer_layout();
     gctx.combine_layout = cfg_.combine_buffer_layout();

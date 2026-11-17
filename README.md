@@ -2,10 +2,32 @@
 
 **Kernel-Initiated Workload-defined Invocations**
 
-KIWI's core provides GPU/host queues and workload-defined callback invocation
-for AMD ROCm/HIP systems. P2P communication and expert-parallel (EP)
-dispatch/combine are **prototype applications built on the invocation layer**,
-not parts of the core.
+KIWI lets GPU kernels invoke host functions on AMD Instinct GPUs with
+**sub-microsecond** one-way latency, as fast as raw PCIe stores. Its core
+provides GPU/host queues and workload-defined callback invocation. P2P
+communication and expert-parallel (EP) dispatch/combine are **prototype
+applications built on the invocation layer**, not parts of the core.
+
+## Supported hardware
+
+KIWI runs on AMD Instinct GPUs with ROCm. It has been tested on:
+
+| GPU | Architecture (`HIP_ARCHITECTURES`) |
+| --- | --- |
+| MI250X | `gfx90a` |
+| MI300X | `gfx942` |
+| MI308X | `gfx942` |
+| MI355X | `gfx950` |
+
+## Performance
+
+On MI300X with ROCm 7.2, a GPU→CPU→GPU round trip through a KIWI queue takes
+1.92 µs (p50), under 1 µs each way. That matches a raw PCIe round trip (a
+plain store and poll each way, with no queue logic). The benchmark is in
+[benchmarks/queue_baselines](benchmarks/queue_baselines/README.md).
+
+The prototype P2P and EP applications built on KIWI also show lower latency
+than existing GPU-initiated communication libraries for small messages.
 
 ## Layout
 
@@ -37,18 +59,20 @@ Requirements: CMake 3.21+, a C++17/ROCm HIP toolchain, and ROCr extended-scope
 fine-grained host memory support for queue allocation.
 
 ```bash
-cmake -S . -B build/core -DHIP_ARCHITECTURES=gfx942
+cmake -S . -B build/core
 cmake --build build/core -j
 ```
 
 This default builds only `kiwi_queue` and `kiwi_invoke`, without fetching LCI or
-requiring MPI, PyTorch, GoogleTest, or CLI11. Set the architecture for your GPU;
-`gfx942` targets MI300X. Disable `KIWI_BUILD_INVOKE` for queues alone.
+requiring MPI, PyTorch, GoogleTest, or CLI11. CMake detects the GPU
+architecture with `rocminfo`; on a machine without a GPU, pass
+`-DHIP_ARCHITECTURES=<arch>` from the table above (otherwise it falls back to
+`gfx942`). Disable `KIWI_BUILD_INVOKE` for queues alone.
 
 Core tests, benchmarks, and examples are opt-in:
 
 ```bash
-cmake -S . -B build/core-tests -DHIP_ARCHITECTURES=gfx942 \
+cmake -S . -B build/core-tests \
   -DKIWI_BUILD_TESTS=ON -DKIWI_BUILD_BENCHMARKS=ON
 cmake --build build/core-tests -j
 ctest --test-dir build/core-tests --output-on-failure
@@ -71,12 +95,12 @@ Both applications are off by default and can be enabled independently:
 
 ```bash
 # P2P only
-cmake -S . -B build/p2p -DKIWI_BUILD_P2P=ON -DHIP_ARCHITECTURES=gfx942
+cmake -S . -B build/p2p -DKIWI_BUILD_P2P=ON
 # EP only (does not build or depend on kiwi_p2p)
-cmake -S . -B build/ep -DKIWI_BUILD_EP=ON -DHIP_ARCHITECTURES=gfx942
+cmake -S . -B build/ep -DKIWI_BUILD_EP=ON
 # Both apps, with their tests and benchmarks
 cmake -S . -B build/apps -DKIWI_BUILD_P2P=ON -DKIWI_BUILD_EP=ON \
-  -DKIWI_BUILD_TESTS=ON -DKIWI_BUILD_BENCHMARKS=ON -DHIP_ARCHITECTURES=gfx942
+  -DKIWI_BUILD_TESTS=ON -DKIWI_BUILD_BENCHMARKS=ON
 cmake --build build/apps -j
 ctest --test-dir build/apps --output-on-failure
 ```

@@ -252,9 +252,7 @@ __device__ inline void reduce_float4_token(
                     acc.w += remote_slot ? ep_load<true>(&hidden_data[d + 3]) : hidden_data[d + 3];
                 }
             }
-            if (num_valid > 0) {
-                out4[vi] = acc;
-            }
+            out4[vi] = acc;
         }
     } else {
         for (int d = range_begin + thread_idx; d < range_end;
@@ -269,9 +267,7 @@ __device__ inline void reduce_float4_token(
                     ? ep_load<true>(&hidden_data[d])
                     : hidden_data[d];
             }
-            if (num_valid > 0) {
-                out[d] = acc;
-            }
+            out[d] = acc;
         }
     }
 }
@@ -333,14 +329,12 @@ __device__ inline void reduce_bf16x8_token(
                     }
                 }
             }
-            if (num_valid > 0) {
-                bf16_vec8_storage_t tmp;
-                #pragma unroll
-                for (int i = 0; i < 8; i++) {
-                    tmp.v[i] = hip_bfloat16(acc[i]);
-                }
-                out4[vi] = *reinterpret_cast<const uint4*>(&tmp);
+            bf16_vec8_storage_t tmp;
+            #pragma unroll
+            for (int i = 0; i < 8; i++) {
+                tmp.v[i] = hip_bfloat16(acc[i]);
             }
+            out4[vi] = *reinterpret_cast<const uint4*>(&tmp);
         }
     } else {
         for (int d = range_begin + thread_idx; d < range_end;
@@ -357,9 +351,7 @@ __device__ inline void reduce_bf16x8_token(
                     ? ep_load<true>(&hidden_data[d])
                     : hidden_data[d]);
             }
-            if (num_valid > 0) {
-                out16[d] = hip_bfloat16(acc);
-            }
+            out16[d] = hip_bfloat16(acc);
         }
     }
 }
@@ -424,14 +416,12 @@ __device__ inline void reduce_fp8x16_token(
                     }
                 }
             }
-            if (num_valid > 0) {
-                byte_vec16_storage_t tmp;
-                #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    tmp.v[i] = float_to_fp8_e4m3_fnuz(acc[i]);
-                }
-                out4[vi] = *reinterpret_cast<const uint4*>(&tmp);
+            byte_vec16_storage_t tmp;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                tmp.v[i] = float_to_fp8_e4m3_fnuz(acc[i]);
             }
+            out4[vi] = *reinterpret_cast<const uint4*>(&tmp);
         }
     } else {
         for (int d = range_begin + thread_idx; d < range_end;
@@ -448,9 +438,7 @@ __device__ inline void reduce_fp8x16_token(
                     : hidden_data[d];
                 acc += fp8_e4m3_fnuz_to_float(raw);
             }
-            if (num_valid > 0) {
-                out8[d] = float_to_fp8_e4m3_fnuz(acc);
-            }
+            out8[d] = float_to_fp8_e4m3_fnuz(acc);
         }
     }
 }
@@ -523,16 +511,14 @@ __device__ inline void reduce_fp4x16_token(
                     }
                 }
             }
-            if (num_valid > 0) {
-                byte_vec16_storage_t tmp;
-                #pragma unroll
-                for (int i = 0; i < 16; i++) {
-                    tmp.v[i] = static_cast<uint8_t>(
-                        float_to_fp4_e2m1fn(lo_acc[i])
-                        | (float_to_fp4_e2m1fn(hi_acc[i]) << 4));
-                }
-                out4[vi] = *reinterpret_cast<const uint4*>(&tmp);
+            byte_vec16_storage_t tmp;
+            #pragma unroll
+            for (int i = 0; i < 16; i++) {
+                tmp.v[i] = static_cast<uint8_t>(
+                    float_to_fp4_e2m1fn(lo_acc[i])
+                    | (float_to_fp4_e2m1fn(hi_acc[i]) << 4));
             }
+            out4[vi] = *reinterpret_cast<const uint4*>(&tmp);
         }
     } else {
         for (int d = range_begin + thread_idx; d < range_end;
@@ -551,11 +537,9 @@ __device__ inline void reduce_fp4x16_token(
                 lo_acc += fp4_e2m1fn_to_float(packed & 0x0f);
                 hi_acc += fp4_e2m1fn_to_float((packed >> 4) & 0x0f);
             }
-            if (num_valid > 0) {
-                out8[d] = static_cast<uint8_t>(
-                    float_to_fp4_e2m1fn(lo_acc)
-                    | (float_to_fp4_e2m1fn(hi_acc) << 4));
-            }
+            out8[d] = static_cast<uint8_t>(
+                float_to_fp4_e2m1fn(lo_acc)
+                | (float_to_fp4_e2m1fn(hi_acc) << 4));
         }
     }
 }
@@ -576,7 +560,7 @@ __global__ void combine_kernel(
         ep_gcontext_t   gctx,
         const void*     d_expert_output,
         const float*    d_expert_weights,
-        void*           d_output,           // [num_tokens][combine_hidden_elems], pre-zeroed
+        void*           d_output,           // [num_tokens][combine_hidden_elems]
         float*          d_output_weights,   // optional [num_tokens][topk]
         int             num_tokens,
         uint64_t*       debug_time_buf,

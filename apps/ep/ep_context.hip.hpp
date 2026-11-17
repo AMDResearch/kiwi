@@ -250,12 +250,6 @@ grid_barrier_phase_reached(uint32_t observed, uint32_t target) {
     return static_cast<int32_t>(observed - target) >= 0;
 }
 
-__host__ __device__ inline grid_barrier_ticket_t
-grid_barrier_advance_ticket(grid_barrier_ticket_t ticket, uint32_t generations) {
-    return grid_barrier_ticket_t{
-        static_cast<uint32_t>(ticket.phase + generations)};
-}
-
 // Reusable grid barrier encoded in one 64-bit word:
 //   low 32 bits  = arrivals in the current generation
 //   high 32 bits = generation/phase
@@ -300,15 +294,6 @@ __device__ inline void grid_barrier_wait(const uint64_t* grid_barrier,
         } while (!grid_barrier_phase_reached(observed_phase, ticket.phase));
     }
     __syncthreads();
-}
-
-__device__ inline grid_barrier_ticket_t
-grid_barrier_arrive_and_wait(uint64_t* grid_barrier,
-                             uint32_t expected_participants) {
-    grid_barrier_ticket_t ticket =
-        grid_barrier_arrive(grid_barrier, expected_participants);
-    grid_barrier_wait(grid_barrier, ticket);
-    return ticket;
 }
 
 __device__ inline void flat_to_rank_slot_direct(
