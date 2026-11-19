@@ -8,6 +8,10 @@ provides GPU/host queues and workload-defined callback invocation. P2P
 communication and expert-parallel (EP) dispatch/combine are **prototype
 applications built on the invocation layer**, not parts of the core.
 
+KIWI is described in the paper
+[A Fast, Programmable GPU-to-CPU Invocation Layer for GPU-Initiated Communication](https://arxiv.org/abs/2611.23848)
+(arXiv:2611.23848). Please [cite it](#citation) if you use KIWI in your work.
+
 ## Supported hardware
 
 KIWI runs on AMD Instinct GPUs with ROCm. It has been tested on:
@@ -28,6 +32,7 @@ plain store and poll each way, with no queue logic). The benchmark is in
 
 The prototype P2P and EP applications built on KIWI also show lower latency
 than existing GPU-initiated communication libraries for small messages.
+See the [paper](https://arxiv.org/abs/2611.23848) for the full evaluation.
 
 ## Layout
 
@@ -148,6 +153,20 @@ execution of the full matrix; unavailable or skipped tests are not passes.
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Citation
+
+```bibtex
+@misc{yan2026kiwi,
+  title         = {A Fast, Programmable GPU-to-CPU Invocation Layer for GPU-Initiated Communication},
+  author        = {Jiakun Yan and Shiksha Patel and David Sidler and Gengyu Rao and Brandon Potter and Bradford Beckmann},
+  year          = {2026},
+  eprint        = {2611.23848},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.DC},
+  url           = {https://arxiv.org/abs/2611.23848}
+}
+```
 
 ## License
 
